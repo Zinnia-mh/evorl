@@ -4,10 +4,12 @@ import jax.numpy as jnp
 import optax
 
 from evorl.algorithms.erl.erl_td3.learner_utility import (
+    build_source_batches,
     derive_diagnostic_key,
     td3_critic_loss,
     virtual_critic_utility,
 )
+from evorl.sample_batch import SampleBatch
 
 
 def _squared_loss(params, batch, key):
@@ -73,3 +75,44 @@ def test_td3_critic_loss_adapter_uses_agent_critic_loss_directly():
 
     assert float(td3_critic_loss(agent, agent_state, batch, key)) == 3.5
     assert agent.received == (agent_state, batch, key)
+
+
+def test_source_batches_keep_individual_provenance_and_equal_batch_sizes():
+    raw_trajectory = SampleBatch(
+        obs=jnp.array(
+            [
+                [[[0.0], [1.0]], [[2.0], [3.0]]],
+                [[[10.0], [11.0]], [[12.0], [13.0]]],
+            ]
+        ),
+        actions=jnp.zeros((2, 2, 2, 1)),
+        rewards=jnp.ones((2, 2, 2)),
+        dones=jnp.zeros((2, 2, 2), dtype=jnp.bool_),
+    )
+
+    batches = build_source_batches(
+        raw_trajectory, generation=12, source_batch_size=3, key=jax.random.key(5)
+    )
+
+    assert [batch.source_id for batch in batches] == ["gen_12_ind_0", "gen_12_ind_1"]
+    assert all(batch.eligible for batch in batches)
+    assert all(batch.batch.rewards.shape[0] == 3 for batch in batches)
+    assert bool(jnp.all(batches[0].batch.obs < 4.0))
+    assert bool(jnp.all(batches[1].batch.obs >= 10.0))
+
+
+def test_source_batch_marks_short_individual_ineligible_instead_of_resampling():
+    raw_trajectory = SampleBatch(
+        obs=jnp.zeros((1, 1, 2, 1)),
+        actions=jnp.zeros((1, 1, 2, 1)),
+        rewards=jnp.ones((1, 1, 2)),
+        dones=jnp.zeros((1, 1, 2), dtype=jnp.bool_),
+    )
+
+    (result,) = build_source_batches(
+        raw_trajectory, generation=1, source_batch_size=3, key=jax.random.key(0)
+    )
+
+    assert result.eligible is False
+    assert result.reason == "insufficient_valid_transitions"
+    assert result.batch is None
