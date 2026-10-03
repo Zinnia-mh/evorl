@@ -2,7 +2,7 @@
 
 ## Document status
 
-**Design only. No replay algorithm is implemented by this document.**
+**Design v1.1 only. No replay algorithm is implemented by this document.**
 
 Source milestone: annotated tag `learner-utility-diagnostic-v1` at commit `df954935334e201f3e2759b848d5be2c177833f7`.
 
@@ -55,7 +55,7 @@ uniform, fitness, TD error, or learner utility
 
 1. **One causal variable:** only EA-source exposure changes.
 2. **Baseline preservation:** `alpha = 0` must reduce to Original ERL sampling, not merely approximate it statistically.
-3. **No source starvation:** every resident EA source retains a uniform component.
+3. **No source starvation or tiny-source amplification:** every resident EA transition retains a uniform component, and a source must satisfy `resident_count_i >= M_min` before its score may alter the weighted component.
 4. **Learner conditioning is temporary:** utility scores become stale and decay to neutral behavior.
 5. **No circular evaluation:** data used to estimate utility cannot be the evidence used to claim algorithmic success.
 6. **Common instrumentation:** all four arms produce the same audit fields and, where feasible, execute the same read-only diagnostic instrumentation.
@@ -102,9 +102,11 @@ rank_normalized_score
 measured_generation
 score_kind
 validity
+resident_count
+weighted_eligible
 ```
 
-The table needs entries only for sources whose transitions may still be resident. Ring-buffer overwrite and the freshness rule bound the active set. V1 must not delete transitions when a score expires; expiry changes the score to neutral sampling behavior.
+The table needs entries only for sources whose transitions may still be resident. Ring-buffer overwrite and the freshness rule bound the active set. V1 must not delete transitions when a score expires or a source falls below the resident-count threshold; either condition changes the source to neutral baseline behavior.
 
 ## 5. Provenance insertion path
 
@@ -136,7 +138,7 @@ Consequences:
 - RL-origin samples remain baseline-uniform and untouched;
 - only conditional selection among EA sources changes;
 - environment interaction, learner update count, and batch size are identical;
-- `alpha = 0` can return the original baseline indices directly, enabling bitwise equivalence.
+- `alpha = 0` must return the original baseline indices directly, without drawing a statistically equivalent replacement, enabling bitwise equivalence.
 
 This overlay is preferable to independently choosing an EA/RL mixture because the latter would introduce a second intervention. It is also preferable to globally weighting all transitions because that would change RL-origin exposure.
 
@@ -152,29 +154,101 @@ r_i in [0, 1]
 
 Higher rank means higher priority for the method being tested. The same normalization procedure is used for fitness, TD error, and utility; only the underlying raw score differs.
 
-### 7.2 Bounded mixture with a uniform floor
+### 7.2 Resident-source eligibility
 
-Let `q_i` be the baseline conditional probability mass of source `i` among resident EA transitions. Because sources can contribute different valid trajectory lengths, `q_i` is occupancy-proportional rather than assumed to be exactly `1/N`. Let:
+Let `n_i = resident_count_i` be the number of currently resident EA transitions belonging to source `i`. A source may participate in score-based redistribution only when all conditions hold:
 
 ```text
-s_i = softmax(r_i / tau)
+n_i >= M_min
+score is finite and valid
+score age <= W
+```
+
+Thus:
+
+```text
+weighted_eligible_i = valid_i and fresh_i and (n_i >= M_min)
+```
+
+If `n_i < M_min`, the source remains in replay and its transitions remain sampleable through neutral baseline behavior, but its score cannot amplify its probability. This prevents a highly ranked source with only one or two surviving transitions from causing repeated sampling of those transitions. `M_min` is a pre-registered pilot parameter and cannot be adjusted using formal return, AUC, or final-return results.
+
+The sampler records, per source and reporting window:
+
+```text
+resident_count
+weighted_eligible
+unique_transition_ratio
+repeat_sampling_rate
+```
+
+For EA draws in a reporting window:
+
+```text
+unique_transition_ratio = number of distinct EA transition indices drawn
+                          / number of EA transition draws
+repeat_sampling_rate = 1 - unique_transition_ratio
+```
+
+The same definitions are used in B, C, and D.
+
+### 7.3 Bounded mixture with a uniform floor
+
+Let `N_EA` be the number of resident EA transitions and let:
+
+```text
+n_i = resident transition count for source i
+q_i = n_i / N_EA
+```
+
+`q_i` is the exact baseline conditional probability mass of source `i`. Define the weighted-component source mass `s_i` so that ineligible sources are neutral rather than amplified:
+
+```text
+I = set of weighted-ineligible resident sources
+E = set of weighted-eligible resident sources
+Q_E = sum_{i in E} q_i
+
+s_i = q_i                                           if i in I
+s_i = Q_E * softmax_E(r_i / tau)                    if i in E
+```
+
+If `E` is empty, `s_i = q_i` for every source. Therefore `sum_i s_i = 1`, ineligible sources retain exactly their baseline source mass in the weighted component, and only the collective mass `Q_E` is redistributed among eligible sources.
+
+The final source-level probability is:
+
+```text
 P(source=i | EA) = (1 - alpha) * q_i + alpha * s_i
 ```
 
-For equal-size sources, this reduces to the intended form:
+For a resident transition `x_ij` belonging to source `i`, within-source sampling is uniform. Therefore:
+
+```text
+P_baseline(x_ij | EA)
+  = q_i * (1 / n_i)
+  = 1 / N_EA
+
+P_weighted(x_ij | EA)
+  = s_i * (1 / n_i)
+
+P(x_ij | EA)
+  = (1 - alpha) * q_i / n_i + alpha * s_i / n_i
+  = (1 - alpha) / N_EA + alpha * s_i / n_i
+```
+
+For `n_i < M_min`, `i` is ineligible and `s_i = q_i`, so every one of its transitions remains exactly transition-uniform rather than being score-amplified. For equal-size, fully eligible sources, the source-level form reduces to:
 
 ```text
 P(i) = (1-alpha)/N + alpha * softmax(rank_normalized(score_i)/tau)
 ```
 
-Within a selected source, one resident transition is sampled uniformly. The `(1-alpha) * q_i` component is the starvation-prevention floor and preserves baseline occupancy effects. V1 does not lock numerical values of `alpha` or `tau`; they must be selected and frozen during a pre-pilot calibration that does not use formal evaluation outcomes.
+The `(1-alpha) / N_EA` transition component is the starvation-prevention floor. V1 does not lock numerical values of `alpha`, `tau`, `W`, or `M_min` in this document; candidate sets and operational thresholds must be registered and frozen through the deterministic calibration protocol in Section 18 before formal matched runs.
 
-### 7.3 Neutral and invalid scores
+### 7.4 Neutral and invalid scores
 
-- missing, non-finite, insufficient-data, or expired scores are neutral;
+- missing, non-finite, insufficient-data, expired, or resident-count-ineligible scores are neutral;
 - if every resident EA score is neutral, conditional EA sampling is baseline-uniform;
 - no invalid score can become a very large positive or negative logit;
 - probabilities are checked for finiteness, normalization, and a nonzero baseline component.
+- when `alpha = 0`, the implementation bypasses all replacement sampling and directly returns the original baseline index; it must not draw a new statistically equivalent index.
 
 ## 8. Four matched pilot arms
 
@@ -233,18 +307,22 @@ At each configured diagnostic checkpoint:
 
 No same-operation feedback is allowed in which a source is sampled to estimate utility and then the same reference loss is immediately reported as algorithm success.
 
-## 10. Stale utility
+## 10. Unified score freshness
 
-Utility is conditioned on the current learner and reference distribution. A score must not remain authoritative indefinitely.
+Utility is conditioned on the current learner and reference distribution. TD error is also learner-conditioned, and even fitness ranks become an old source annotation as replay ages. To keep score type as the only causal difference among B, C, and D, V1 uses one identical freshness policy:
 
-V1 prefers a **finite freshness window** because it has simple, auditable semantics:
+```text
+W_fitness = W_TD = W_utility = W
+```
+
+The finite window has simple, auditable semantics:
 
 ```text
 age_i = current_generation - measured_generation_i
 fresh_i = age_i <= W
 ```
 
-Fresh scores use the selected rank weight. Expired scores revert to neutral baseline weight; their transitions remain in replay. `W` is selected before formal matched runs and is shared by fitness-, TD-, and utility-aware arms where a freshness rule is applicable, or the comparator's exception is explicitly justified.
+Fresh scores may use the selected rank weight. In B, C, and D, a score older than the same `W` becomes neutral baseline behavior. Its transitions remain in replay and are not deleted. No arm-specific stale handling, window, exception, or decay is allowed in V1.
 
 An optional later version may use monotone decay to uniform:
 
@@ -252,7 +330,7 @@ An optional later version may use monotone decay to uniform:
 effective_alpha_i = alpha * decay(age_i)
 ```
 
-but V1 should not combine a learned decay rule with the first causal pilot. The pilot logs source age, fraction of EA mass with fresh scores, expired-score sampling rate, and effective source count.
+but any utility-specific or score-specific decay is a future version, not V1. The pilot logs source age, fraction of EA mass with fresh scores, expired-score sampling rate, and effective source count using identical definitions in B, C, and D.
 
 ## 11. Anti-circularity and evaluation separation
 
@@ -271,6 +349,21 @@ Algorithm success is evaluated using independent behavior-level targets:
 - periodic deterministic evaluation return;
 - evaluation-return area under the learning curve under the matched interaction budget;
 - final evaluation return as a secondary endpoint.
+
+Let the fixed, matched environment-interaction checkpoints be:
+
+```text
+b_0 < b_1 < ... < b_K
+```
+
+and let `R[m,s,k]` be deterministic evaluation return for method `m`, matched seed `s`, and checkpoint `k`. The primary AUC is the trapezoidal integral:
+
+```text
+AUC[m,s] = sum_{k=0}^{K-1}
+             0.5 * (R[m,s,k] + R[m,s,k+1]) * (b_{k+1} - b_k)
+```
+
+A, B, C, and D use exactly the same evaluation checkpoints, evaluation episode count, and interaction-budget x-axis. Evaluation frequency cannot be increased for one arm or changed to improve numerical AUC. Missing scheduled evaluations invalidate the matched AUC pair unless the pre-registered missing-run policy is applied uniformly.
 
 ### Independent learner-side outcome
 
@@ -348,8 +441,9 @@ Each run records:
 - full resolved configuration and Git commit;
 - environment episodes/timesteps and learner update count;
 - baseline indices, final indices, and EA/RL slot count for audit samples;
-- source token, origin, raw score, rank score, age, freshness, and final weight;
+- source token, origin, raw score, rank score, age, freshness, `resident_count`, `weighted_eligible`, and final weight;
 - source sampling counts and effective number of sampled EA sources;
+- unique-transition ratio and repeat-sampling rate;
 - fraction of sampling mass assigned through the uniform floor;
 - evaluation return and evaluation AUC inputs;
 - `B_ref` and optional `B_eval` fingerprints;
@@ -410,10 +504,21 @@ The pilot receives **GO for broader replication** only if all conditions hold:
 
 1. every equivalence, budget, and anti-circularity gate passes;
 2. Utility-aware sampling remains non-degenerate and does not collapse to one source or uniform-only behavior;
-3. median evaluation-return AUC for D minus A is positive across the three matched seeds;
-4. D improves AUC over A in at least two of three matched seeds;
-5. D does not show systematic final-return degradation relative to A;
-6. D shows observable value beyond at least one heuristic comparator B or C;
+3. `median_seed[AUC[D,s] - AUC[A,s]] > 0`;
+4. at least two of three matched seeds satisfy `AUC[D,s] > AUC[A,s]`;
+5. D does not show systematic final-return degradation relative to A: if all three matched seeds satisfy `FinalReturn[D,s] < FinalReturn[A,s]`, the result is an automatic NO-GO;
+6. D exceeds at least one heuristic comparator under the same executable rule:
+
+```text
+(median_seed[AUC[D,s] - AUC[B,s]] > 0
+ and at least 2/3 seeds satisfy AUC[D,s] > AUC[B,s])
+
+OR
+
+(median_seed[AUC[D,s] - AUC[C,s]] > 0
+ and at least 2/3 seeds satisfy AUC[D,s] > AUC[C,s])
+```
+
 7. the result is not explained by changed EA/RL exposure, update count, interaction budget, or evaluation leakage;
 8. compute and memory overhead are measured and operationally acceptable.
 
@@ -421,17 +526,50 @@ The pilot receives **NO-GO / redesign** if any correctness gate fails, if D syst
 
 Three seeds are a pilot decision gate, not a definitive significance claim. Any broader claim requires a separately approved multi-environment replication plan.
 
-## 18. Parameter governance
+## 18. Deterministic calibration and parameter governance
 
-V1 intentionally leaves `alpha`, `tau`, and freshness window `W` unlocked in this design. Before formal runs:
+V1 leaves numerical values unlocked here but fixes the selection process. Before any formal pilot, register finite ordered candidate sets:
 
-1. define a small calibration space using only smoke behavior and sampler diagnostics;
-2. reject settings that violate the uniform floor, numerical stability, or effective-source requirements;
-3. select one configuration without using formal evaluation outcomes;
-4. record it as a versioned configuration;
-5. freeze it for all four matched arms where applicable.
+```text
+alpha in A
+tau in T
+W in W_set
+M_min in M_set
+```
 
-Changing weighting, decay, or outcome definitions after viewing formal results creates a new pilot version and requires rerunning all arms. No environment-specific post-hoc tuning is permitted.
+The candidate sets, their order, operational thresholds, and tie-break order are versioned and timestamped before calibration. Calibration may use only sampler and systems behavior:
+
+```text
+effective source count / ESS
+maximum source probability mass
+uniform-floor contribution
+fresh-score coverage
+expired-score fraction
+repeat-sampling rate
+numerical stability
+memory and compute overhead
+```
+
+It must not use:
+
+```text
+evaluation return
+evaluation AUC
+final return
+formal pilot performance
+```
+
+The deterministic selection procedure is:
+
+1. **Correctness filter:** remove any candidate that violates probability normalization, finiteness, exact mixture preservation, `alpha=0` equivalence, metadata alignment, or the pre-registered memory limit.
+2. **Operational-band filter:** remove any candidate outside pre-registered acceptable bands for ESS/effective source count, maximum source mass, uniform-floor contribution, fresh-score coverage, expired-score fraction, repeat-sampling rate, or compute overhead.
+3. **Sampler criterion:** among survivors, minimize the absolute distance between median ESS fraction and a pre-registered target ESS fraction. This target controls intervention strength without consulting return.
+4. **Deterministic tie-break:** if candidates tie at the recorded precision, choose in order: lower maximum source probability mass, lower repeat-sampling rate, lower compute overhead, then the earliest tuple in the pre-registered lexicographic ordering of `A × T × W_set × M_set`.
+5. **Freeze:** write the selected tuple, candidate-set hashes, thresholds, calibration data checksum, and selection trace to a versioned resolved config. Use that frozen tuple for the formal matched A/B/C/D pilot. A uses `alpha=0`; B/C/D use the same selected `alpha`, `tau`, `W`, and `M_min` so the scoring criterion remains the only causal difference.
+
+If frozen diagnostic-v1 data help construct `W_set` or select `W`, they may be used only for pre-declared score stability and within-source rank-persistence calculations. No intervention return exists in diagnostic-v1, and no proxy based on future return may enter the rule. The rank-persistence statistic, threshold, and tie-break must be registered before applying them.
+
+Changing weighting, freshness, `M_min`, calibration thresholds, or outcome definitions after viewing formal results creates a new pilot version and requires rerunning all arms. No environment-specific post-hoc tuning is permitted.
 
 ## 19. Planned implementation boundaries
 
@@ -456,11 +594,11 @@ The reviewer should approve or revise:
 
 1. baseline-draw overlay as the mechanism for fixing EA/RL exposure;
 2. occupancy-proportional `q_i` as the exact baseline conditional source mass;
-3. finite freshness window as V1 staleness handling;
+3. one shared finite freshness window `W_fitness = W_TD = W_utility = W` as V1 staleness handling;
 4. common diagnostic execution across arms;
 5. independent `B_eval` when a learner-loss endpoint is used;
 6. the direction of TD-error comparator C;
 7. the go/no-go criteria;
-8. the calibration and freeze procedure for `alpha`, `tau`, and `W`.
+8. the calibration and freeze procedure for `alpha`, `tau`, `W`, and `M_min`.
 
 Implementation planning must not begin until this design has been reviewed and explicitly approved.
