@@ -1,8 +1,8 @@
 """Pure source-score and baseline-draw overlay primitives for the replay pilot.
 
-Phase 4 adds fixed-shape source-score bookkeeping.  It still deliberately
-performs no replacement, weighting, freshness, eligibility, or intervention
-random draw.
+Phase 5 adds deterministic freshness and resident eligibility.  It still
+deliberately performs no replacement, weighting, probability calculation, or
+intervention random draw.
 """
 
 from typing import NamedTuple
@@ -72,6 +72,15 @@ class ResidentCountUpdateResult(NamedTuple):
     status: chex.Array
 
 
+class SourceEligibilityResult(NamedTuple):
+    """Derived eligibility state for one generation."""
+
+    table: SourceScoreTable
+    eligible: chex.Array
+    age: chex.Array
+    eligible_count: chex.Array
+
+
 def init_source_score_table(capacity: int) -> SourceScoreTable:
     """Allocate the complete fixed-shape table before JIT compilation."""
     capacity = int(capacity)
@@ -113,6 +122,53 @@ def source_score_table_nbytes(capacity: int) -> int:
         )
     )
     return capacity * per_slot + np.dtype(np.int32).itemsize
+
+
+def compute_source_eligibility(
+    table: SourceScoreTable,
+    current_generation,
+    freshness_window: int,
+    min_resident: int,
+) -> SourceEligibilityResult:
+    """Recompute which valid resident sources may be amplified later.
+
+    This function is deterministic and only derives ``weighted_eligible``;
+    ineligible sources and their replay transitions remain fully resident.
+    """
+    freshness_window = int(freshness_window)
+    min_resident = int(min_resident)
+    if freshness_window < 0:
+        raise ValueError("freshness_window must be non-negative")
+    if min_resident < 1:
+        raise ValueError("min_resident must be positive")
+
+    current_generation = jnp.asarray(current_generation, dtype=jnp.int32)
+    measured_generation = table.measured_generation.astype(jnp.int32)
+    age = current_generation - measured_generation
+    recognized_kind = (
+        (table.score_kind == SCORE_KIND_FITNESS)
+        | (table.score_kind == SCORE_KIND_TD)
+        | (table.score_kind == SCORE_KIND_UTILITY)
+    )
+    score_exists = (
+        (table.source_token >= 0)
+        & table.validity
+        & (table.version != NO_SCORE_VERSION)
+        & (measured_generation != NO_MEASURED_GENERATION)
+        & recognized_kind
+        & jnp.isfinite(table.raw_score)
+        & jnp.isfinite(table.rank_normalized_score)
+    )
+    fresh = (age >= 0) & (age <= freshness_window)
+    resident_ok = table.resident_count >= min_resident
+    eligible = score_exists & fresh & resident_ok
+    updated_table = table._replace(weighted_eligible=eligible)
+    return SourceEligibilityResult(
+        table=updated_table,
+        eligible=eligible,
+        age=age,
+        eligible_count=jnp.sum(eligible, dtype=jnp.int32),
+    )
 
 
 def rank_normalize_within_checkpoint(

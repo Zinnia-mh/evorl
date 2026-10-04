@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import chex
 import jax
 import jax.numpy as jnp
+import pytest
 
 from evorl.algorithms.erl.erl_td3.source_replay import (
     SCORE_KIND_FITNESS,
@@ -16,6 +17,7 @@ from evorl.algorithms.erl.erl_td3.source_replay import (
     apply_checkpoint_score_update,
     build_checkpoint_score_update,
     build_origin_slot_masks,
+    compute_source_eligibility,
     draw_baseline_indices,
     init_source_score_table,
     overlay_ea_indices,
@@ -453,3 +455,212 @@ def test_score_table_eager_and_jit_updates_are_exactly_equal():
     eager_resident = update_resident_counts(*args)
     jit_resident = jax.jit(update_resident_counts)(*args)
     chex.assert_trees_all_equal(eager_resident, jit_resident)
+
+
+def _eligibility_table(
+    *,
+    tokens=(10, 20, 30, -1),
+    raw=(1.0, 2.0, 3.0, 0.0),
+    rank=(0.0, 0.5, 1.0, 0.0),
+    measured=(10, 10, 10, -1),
+    kinds=(SCORE_KIND_FITNESS, SCORE_KIND_TD, SCORE_KIND_UTILITY, SCORE_KIND_NONE),
+    validity=(True, True, True, False),
+    counts=(4, 4, 4, 0),
+    versions=(0, 0, 0, -1),
+    weighted=(False, False, False, False),
+):
+    # Malformed score metadata is an explicit eligibility input class.  Build
+    # it without the process-wide NaN trap rejecting the fixture itself.
+    with jax.debug_nans(False):
+        table = init_source_score_table(len(tokens))
+        return table._replace(
+            source_token=jnp.asarray(tokens, dtype=jnp.int32),
+            raw_score=jnp.asarray(raw, dtype=jnp.float32),
+            rank_normalized_score=jnp.asarray(rank, dtype=jnp.float32),
+            measured_generation=jnp.asarray(measured, dtype=jnp.int32),
+            score_kind=jnp.asarray(kinds, dtype=jnp.int8),
+            validity=jnp.asarray(validity, dtype=jnp.bool_),
+            resident_count=jnp.asarray(counts, dtype=jnp.int32),
+            weighted_eligible=jnp.asarray(weighted, dtype=jnp.bool_),
+            version=jnp.asarray(versions, dtype=jnp.int32),
+            current_version=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+
+def _eligibility(table, *, current=10, window=3, minimum=4):
+    return compute_source_eligibility(
+        table,
+        current_generation=current,
+        freshness_window=window,
+        min_resident=minimum,
+    )
+
+
+def test_fresh_valid_source_with_minimum_residency_is_eligible():
+    result = _eligibility(_eligibility_table())
+    assert bool(result.eligible[0])
+
+
+def test_age_equal_to_window_is_still_eligible():
+    result = _eligibility(_eligibility_table(measured=(7, 10, 10, -1)))
+    assert int(result.age[0]) == 3
+    assert bool(result.eligible[0])
+
+
+def test_age_one_past_window_is_ineligible():
+    result = _eligibility(_eligibility_table(measured=(6, 10, 10, -1)))
+    assert int(result.age[0]) == 4
+    assert not bool(result.eligible[0])
+
+
+def test_future_measured_generation_is_ineligible():
+    result = _eligibility(
+        _eligibility_table(measured=(11, 10, 10, -1)),
+        current=jnp.asarray(10, dtype=jnp.uint32),
+    )
+    assert int(result.age[0]) == -1
+    assert not bool(result.eligible[0])
+
+
+def test_insufficient_resident_source_is_neutral():
+    result = _eligibility(_eligibility_table(counts=(3, 4, 4, 0)))
+    assert not bool(result.eligible[0])
+
+
+def test_resident_count_equal_to_minimum_is_eligible():
+    result = _eligibility(_eligibility_table(counts=(4, 4, 4, 0)))
+    assert bool(result.eligible[0])
+
+
+def test_missing_score_version_is_neutral():
+    result = _eligibility(_eligibility_table(versions=(-1, 0, 0, -1)))
+    assert not bool(result.eligible[0])
+
+
+def test_missing_measured_generation_is_neutral():
+    result = _eligibility(_eligibility_table(measured=(-1, 10, 10, -1)))
+    assert not bool(result.eligible[0])
+
+
+def test_invalid_score_is_neutral():
+    result = _eligibility(_eligibility_table(validity=(False, True, True, False)))
+    assert not bool(result.eligible[0])
+
+
+@pytest.mark.parametrize("value", [jnp.nan, jnp.inf, -jnp.inf])
+def test_nonfinite_raw_score_is_neutral(value):
+    result = _eligibility(_eligibility_table(raw=(value, 2.0, 3.0, 0.0)))
+    assert not bool(result.eligible[0])
+
+
+def test_nan_score_is_neutral():
+    result = _eligibility(_eligibility_table(raw=(jnp.nan, 2.0, 3.0, 0.0)))
+    assert not bool(result.eligible[0])
+
+
+def test_inf_score_is_neutral():
+    result = _eligibility(_eligibility_table(rank=(jnp.inf, 0.5, 1.0, 0.0)))
+    assert not bool(result.eligible[0])
+
+
+def test_empty_source_slot_is_neutral():
+    result = _eligibility(_eligibility_table())
+    assert not bool(result.eligible[3])
+
+
+def test_zero_resident_source_is_neutral():
+    result = _eligibility(_eligibility_table(counts=(0, 4, 4, 0)))
+    assert not bool(result.eligible[0])
+
+
+def test_empty_eligible_set_has_no_weighted_sources():
+    table = _eligibility_table(validity=(False, False, False, False))
+    result = _eligibility(table)
+    assert int(result.eligible_count) == 0
+    assert not bool(jnp.any(result.table.weighted_eligible))
+
+
+def test_single_eligible_source_marks_only_that_source():
+    table = _eligibility_table(counts=(4, 3, 0, 0))
+    result = _eligibility(table)
+    chex.assert_trees_all_equal(
+        result.eligible, jnp.asarray([True, False, False, False])
+    )
+    chex.assert_trees_all_equal(result.table.resident_count, table.resident_count)
+
+
+def test_mixed_eligible_ineligible_sources_have_exact_mask():
+    table = _eligibility_table(
+        tokens=(10, 20, 30, 40, -1, -2),
+        raw=(1.0, 2.0, 3.0, jnp.nan, 0.0, 5.0),
+        rank=(0.1, 0.2, 0.3, 0.4, 0.0, 0.5),
+        measured=(10, 10, 5, 10, -1, 10),
+        kinds=(
+            SCORE_KIND_FITNESS,
+            SCORE_KIND_TD,
+            SCORE_KIND_UTILITY,
+            SCORE_KIND_FITNESS,
+            SCORE_KIND_NONE,
+            SCORE_KIND_TD,
+        ),
+        validity=(True, True, True, True, False, True),
+        counts=(4, 3, 4, 4, 0, 4),
+        versions=(0, 0, 0, 0, -1, 0),
+    )
+    result = _eligibility(table)
+    chex.assert_trees_all_equal(
+        result.eligible,
+        jnp.asarray([True, False, False, False, False, False]),
+    )
+
+
+def test_all_score_kinds_share_identical_window_and_min_resident_rules():
+    table = _eligibility_table(
+        measured=(7, 7, 7, -1),
+        counts=(4, 4, 4, 0),
+    )
+    result = _eligibility(table, current=10, window=3, minimum=4)
+    chex.assert_trees_all_equal(
+        result.eligible, jnp.asarray([True, True, True, False])
+    )
+
+
+def test_eligibility_refresh_clears_previously_true_stale_flag():
+    table = _eligibility_table(
+        measured=(1, 1, 1, -1), weighted=(True, True, True, True)
+    )
+    result = _eligibility(table, current=10, window=3)
+    assert not bool(jnp.any(result.table.weighted_eligible))
+
+
+def test_eligibility_does_not_modify_score_or_resident_fields():
+    table = _eligibility_table(weighted=(True, False, True, False))
+    result = _eligibility(table)
+    for field in table._fields:
+        if field != "weighted_eligible":
+            chex.assert_trees_all_equal(getattr(result.table, field), getattr(table, field))
+
+
+def test_eligibility_eager_and_jit_are_exactly_equal():
+    table = _eligibility_table(measured=(7, 8, 11, -1))
+    eager = _eligibility(table, current=jnp.asarray(10, dtype=jnp.uint32))
+    compiled = jax.jit(
+        compute_source_eligibility,
+        static_argnames=("freshness_window", "min_resident"),
+    )(
+        table,
+        current_generation=jnp.asarray(10, dtype=jnp.uint32),
+        freshness_window=3,
+        min_resident=4,
+    )
+    chex.assert_trees_all_equal(eager, compiled)
+
+
+def test_negative_window_is_rejected():
+    with pytest.raises(ValueError, match="freshness_window"):
+        _eligibility(_eligibility_table(), window=-1)
+
+
+def test_nonpositive_min_resident_is_rejected():
+    with pytest.raises(ValueError, match="min_resident"):
+        _eligibility(_eligibility_table(), minimum=0)
