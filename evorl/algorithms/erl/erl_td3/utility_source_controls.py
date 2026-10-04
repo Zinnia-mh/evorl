@@ -120,7 +120,11 @@ def tree_fingerprint(tree: Any) -> str:
     """Hash leaf shape, dtype and bytes for checkpoint audit evidence."""
     digest = hashlib.sha256()
     for leaf in jtu.tree_leaves(tree):
-        array = np.asarray(jax.device_get(leaf))
+        device_leaf = jax.device_get(leaf)
+        try:
+            array = np.asarray(device_leaf)
+        except TypeError:
+            array = np.asarray(jax.random.key_data(device_leaf))
         digest.update(str(array.shape).encode())
         digest.update(str(array.dtype).encode())
         digest.update(array.tobytes(order="C"))
