@@ -44,6 +44,7 @@ class FrozenDiagnosticSnapshot:
     reference_batches: tuple[Any, ...] = ()
     reference_fingerprints: tuple[str, ...] = ()
     replay_control_batches: tuple[Any, ...] = ()
+    replay_control_fingerprints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

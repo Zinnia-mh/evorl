@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 
 import jax
 
 from .erl_learner_utility import ERLLearnerUtilityWorkflow
+from .learner_utility import derive_diagnostic_key
 from .utility_source_controls import FrozenDiagnosticSnapshot, tree_fingerprint
 
 
 SOURCE_CONTROL_TAG = 0x5343
+SOURCE_CONTROL_REFERENCE_TAG = 0x53435246
+SOURCE_CONTROL_REPLAY_RANDOM_TAG = 0x53435252
 
 
 def _replay_metadata_fingerprint(replay_state) -> str:
@@ -63,4 +67,63 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             ),
             counter_fingerprint=tree_fingerprint(counters),
         )
+        context.controls_eligible = False
+        context.controls_reason = None
+
+        expected_batch_size = int(self.config.source_batch_size)
+        replay_batch_size = int(self.replay_buffer.sample_batch_size)
+        if replay_batch_size != expected_batch_size:
+            raise ValueError(
+                "replay sample_batch_size must equal diagnostic source_batch_size: "
+                f"{replay_batch_size} != {expected_batch_size}"
+            )
+
+        if not bool(
+            jax.device_get(
+                self.replay_buffer.can_sample(state.replay_buffer_state)
+            )
+        ):
+            context.controls_reason = "replay_not_ready"
+            return context
+
+        reference_namespace = derive_diagnostic_key(
+            context.key,
+            context.generation,
+            SOURCE_CONTROL_REFERENCE_TAG,
+        )
+        replay_namespace = derive_diagnostic_key(
+            context.key,
+            context.generation,
+            SOURCE_CONTROL_REPLAY_RANDOM_TAG,
+        )
+        reference_batches = tuple(
+            self.replay_buffer.sample(
+                state.replay_buffer_state,
+                jax.random.fold_in(reference_namespace, index),
+            )
+            for index in range(
+                int(getattr(self.config, "num_reference_batches", 4))
+            )
+        )
+        replay_control_batches = tuple(
+            self.replay_buffer.sample(
+                state.replay_buffer_state,
+                jax.random.fold_in(replay_namespace, index),
+            )
+            for index in range(
+                int(getattr(self.config, "num_random_control_batches", 8))
+            )
+        )
+        context.snapshot = replace(
+            context.snapshot,
+            reference_batches=reference_batches,
+            reference_fingerprints=tuple(
+                tree_fingerprint(batch) for batch in reference_batches
+            ),
+            replay_control_batches=replay_control_batches,
+            replay_control_fingerprints=tuple(
+                tree_fingerprint(batch) for batch in replay_control_batches
+            ),
+        )
+        context.controls_eligible = True
         return context
