@@ -24,6 +24,7 @@ RL_SOURCE_TOKEN = -1
 UNSET_SOURCE_GENERATION = -1
 RL_SOURCE_GENERATION = -1
 UNSET_SCORE_VERSION = -1
+NO_SCORE_VERSION = -1
 RL_SCORE_VERSION = -1
 
 
@@ -177,4 +178,44 @@ class SourceAwareReplayBuffer(ReplayBuffer):
             buffer_size=jnp.minimum(
                 buffer_state.buffer_size + batch_size, self.capacity
             ),
+        )
+
+    def add_provenance(
+        self,
+        buffer_state: SourceAwareReplayBufferState,
+        provenance: ReplayProvenance,
+        mask: chex.Array | None = None,
+        *,
+        current_index: chex.Array | None = None,
+    ) -> SourceAwareReplayBufferState:
+        """Write only provenance sidecars for an already-added payload batch."""
+        first_leaf = jtu.tree_leaves(provenance)[0]
+        batch_shape = (first_leaf.shape[0],)
+        start_index = (
+            buffer_state.current_index if current_index is None else current_index
+        )
+
+        if mask is not None:
+            assert mask.ndim == 1
+            chex.assert_shape(mask, batch_shape)
+            cumsum_mask = jnp.cumsum(mask, axis=0, dtype=jnp.int32)
+            indices = (start_index + cumsum_mask - 1) % self.capacity
+            indices = jnp.where(mask, indices, self.capacity)
+        else:
+            indices = (
+                start_index + jnp.arange(first_leaf.shape[0], dtype=jnp.int32)
+            ) % self.capacity
+
+        sidecars = ReplayProvenance(
+            origin_type=buffer_state.origin_type,
+            source_token=buffer_state.source_token,
+            source_generation=buffer_state.source_generation,
+            score_version=buffer_state.score_version,
+        )
+        sidecars = tree_set(sidecars, provenance, indices, unique_indices=False)
+        return buffer_state.replace(
+            origin_type=sidecars.origin_type,
+            source_token=sidecars.source_token,
+            source_generation=sidecars.source_generation,
+            score_version=sidecars.score_version,
         )

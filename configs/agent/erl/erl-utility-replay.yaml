@@ -6,6 +6,7 @@ workflow_cls: evorl.algorithms.erl.erl_td3.erl_utility_replay.ERLUtilityReplayWo
 arm: uniform
 score_kind: uniform
 alpha: 0
+replay_temperature: 1.0
 
 num_envs: 1
 normalize_obs: false

@@ -11,13 +11,20 @@ from evorl.algorithms.erl.erl_td3.erl_utility_replay import (
     ERLUtilityReplayWorkflow,
     UtilityReplayBuffer,
     alpha_zero_sample,
+    make_ea_rollout_provenance,
 )
 from evorl.algorithms.erl.erl_td3.erl_origin import ERLWorkflow
 from evorl.replay_buffers.replay_buffer import ReplayBuffer
 from evorl.replay_buffers.source_aware_replay_buffer import (
     EA_ORIGIN,
+    NO_SCORE_VERSION,
     RL_ORIGIN,
+    RL_SCORE_VERSION,
+    RL_SOURCE_GENERATION,
+    RL_SOURCE_TOKEN,
+    make_rl_provenance,
 )
+from evorl.utils.jax_utils import is_jitted
 
 
 def _filled_states():
@@ -210,3 +217,147 @@ def test_alpha_zero_rejects_nonzero_alpha_at_build_gate(monkeypatch):
         pass
     else:
         raise AssertionError("Phase 3 must reject non-zero alpha")
+
+
+def test_workflow_ea_provenance_records_actual_generation():
+    provenance = make_ea_rollout_provenance(
+        generation=7, population_size=4, time_size=2, episode_batch=1
+    )
+    chex.assert_trees_all_equal(
+        provenance.source_generation, jnp.full((8,), 7, dtype=jnp.int32)
+    )
+
+
+def test_same_individual_across_generations_has_distinct_source_token():
+    gen_10 = make_ea_rollout_provenance(
+        generation=10, population_size=4, time_size=1, episode_batch=1
+    )
+    gen_11 = make_ea_rollout_provenance(
+        generation=11, population_size=4, time_size=1, episode_batch=1
+    )
+    assert int(gen_10.source_token[3]) != int(gen_11.source_token[3])
+
+
+def test_source_token_matches_generation_population_individual_encoding():
+    provenance = make_ea_rollout_provenance(
+        generation=10, population_size=4, time_size=2, episode_batch=1
+    )
+    chex.assert_trees_all_equal(
+        provenance.source_token,
+        jnp.asarray([40, 41, 42, 43, 40, 41, 42, 43], dtype=jnp.int32),
+    )
+
+
+def test_unscored_ea_transition_uses_no_score_version_sentinel():
+    provenance = make_ea_rollout_provenance(
+        generation=3, population_size=2, time_size=2, episode_batch=1
+    )
+    chex.assert_trees_all_equal(
+        provenance.score_version,
+        jnp.full((4,), NO_SCORE_VERSION, dtype=jnp.int32),
+    )
+
+
+def test_rl_provenance_sentinels_remain_unchanged():
+    provenance = make_rl_provenance(batch_size=3)
+    chex.assert_trees_all_equal(
+        provenance.source_token, jnp.full((3,), RL_SOURCE_TOKEN, jnp.int32)
+    )
+    chex.assert_trees_all_equal(
+        provenance.source_generation,
+        jnp.full((3,), RL_SOURCE_GENERATION, jnp.int32),
+    )
+    chex.assert_trees_all_equal(
+        provenance.score_version, jnp.full((3,), RL_SCORE_VERSION, jnp.int32)
+    )
+
+
+def test_td3_tau_and_replay_temperature_are_distinct_config_fields():
+    with initialize(config_path="../configs", version_base=None):
+        config = compose(
+            config_name="config",
+            overrides=[
+                "agent=erl/erl-utility-replay",
+                "env=brax/swimmer",
+                "replay_temperature=0.37",
+            ],
+        )
+    assert config.tau == 0.005
+    assert config.replay_temperature == 0.37
+
+
+def test_alpha_zero_tiny_jit_workflow_is_exactly_baseline_equivalent():
+    overrides = [
+        "env=brax/swimmer",
+        "env.max_episode_steps=1",
+        "num_envs=1",
+        "pop_size=4",
+        "num_elites=1",
+        "num_rl_agents=1",
+        "episodes_for_fitness=1",
+        "rollout_episodes=1",
+        "batch_size=4",
+        "replay_buffer_capacity=64",
+        "warmup_iters=0",
+        "actor_update_interval=1",
+        "rl_updates_frac=0.25",
+        "agent_network.critic_hidden_layer_sizes=[8,8]",
+        "agent_network.actor_hidden_layer_sizes=[8,8]",
+        "num_eval_envs=1",
+        "eval_episodes=1",
+    ]
+    with initialize(config_path="../configs", version_base=None):
+        base_cfg = compose(
+            config_name="config", overrides=["agent=erl/erl-ori", *overrides]
+        )
+        pilot_cfg = compose(
+            config_name="config",
+            overrides=["agent=erl/erl-utility-replay", *overrides],
+        )
+    baseline = ERLWorkflow.build_from_config(base_cfg, enable_jit=True)
+    pilot = ERLUtilityReplayWorkflow.build_from_config(pilot_cfg, enable_jit=True)
+    assert is_jitted(baseline._ec_rollout)
+    assert is_jitted(pilot._baseline_ec_rollout)
+    assert is_jitted(pilot._baseline_rl_rollout)
+    assert not is_jitted(pilot._ec_rollout)
+    assert not is_jitted(pilot._rl_rollout)
+
+    key = jax.random.PRNGKey(3031)
+    baseline_state = baseline.setup(key)
+    pilot_state = pilot.setup(key)
+    intervention_key = pilot.intervention_key
+    baseline_metrics, baseline_state = baseline.step(baseline_state)
+    pilot_metrics, pilot_state = pilot.step(pilot_state)
+
+    chex.assert_trees_all_equal(baseline_state.key, pilot_state.key)
+    chex.assert_trees_all_equal(baseline_state.agent_state, pilot_state.agent_state)
+    chex.assert_trees_all_equal(baseline_state.opt_state, pilot_state.opt_state)
+    chex.assert_trees_all_equal(baseline_state.ec_opt_state, pilot_state.ec_opt_state)
+    chex.assert_trees_all_equal(baseline_state.metrics, pilot_state.metrics)
+    chex.assert_trees_all_equal(
+        baseline_state.replay_buffer_state.data,
+        pilot_state.replay_buffer_state.data,
+    )
+    chex.assert_trees_all_equal(
+        baseline_state.replay_buffer_state.current_index,
+        pilot_state.replay_buffer_state.current_index,
+    )
+    chex.assert_trees_all_equal(
+        baseline_state.replay_buffer_state.buffer_size,
+        pilot_state.replay_buffer_state.buffer_size,
+    )
+    chex.assert_trees_all_equal(
+        baseline_metrics.replace(time_cost_per_iter=0.0),
+        pilot_metrics.replace(time_cost_per_iter=0.0),
+    )
+    chex.assert_trees_all_equal(pilot.intervention_key, intervention_key)
+
+    _, pilot_state = pilot.step(pilot_state)
+    resident = jnp.arange(pilot_state.replay_buffer_state.buffer_size)
+    ea_resident = (
+        pilot_state.replay_buffer_state.origin_type[resident] == EA_ORIGIN
+    )
+    ea_generations = pilot_state.replay_buffer_state.source_generation[resident][
+        ea_resident
+    ]
+    assert set(map(int, jnp.unique(ea_generations).tolist())) == {1, 2}
