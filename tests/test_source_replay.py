@@ -14,6 +14,7 @@ from evorl.algorithms.erl.erl_td3.source_replay import (
     SCORE_TABLE_ERROR_NEGATIVE_COUNT,
     SCORE_TABLE_ERROR_VERSION,
     SCORE_TABLE_OK,
+    apply_weighted_ea_overlay,
     apply_checkpoint_score_update,
     build_weighted_source_distribution,
     build_checkpoint_score_update,
@@ -920,3 +921,133 @@ def test_weighted_sampler_eager_and_jit_are_exactly_equal():
         sample_weighted_ea_indices, static_argnames=("sample_size",)
     )(compiled_distribution, key, sample_size=64)
     chex.assert_trees_all_equal(eager_sample, compiled_sample)
+
+
+def _overlay_fixture():
+    distribution = _distribution(alpha=0.8, temperature=0.4)
+    origin_type = jnp.asarray(
+        [EA_ORIGIN] * 10 + [RL_ORIGIN, RL_ORIGIN], dtype=jnp.int8
+    )
+    baseline_indices = jnp.asarray([10, 0, 10, 4, 7, 10], dtype=jnp.int32)
+    return distribution, origin_type, baseline_indices
+
+
+def test_real_overlay_changes_only_ea_slots():
+    distribution, origin_type, baseline_indices = _overlay_fixture()
+    result = apply_weighted_ea_overlay(
+        baseline_indices, origin_type, distribution, jax.random.key(7)
+    )
+
+    chex.assert_trees_all_equal(
+        result.final_indices[result.rl_slot_mask],
+        baseline_indices[result.rl_slot_mask],
+    )
+    assert bool(jnp.any(
+        result.final_indices[result.ea_slot_mask]
+        != baseline_indices[result.ea_slot_mask]
+    ))
+
+
+def test_real_overlay_preserves_positions_counts_and_batch_size():
+    distribution, origin_type, baseline_indices = _overlay_fixture()
+    result = apply_weighted_ea_overlay(
+        baseline_indices, origin_type, distribution, jax.random.key(9)
+    )
+
+    chex.assert_trees_all_equal(
+        result.ea_slot_mask,
+        jnp.asarray([False, True, False, True, True, False]),
+    )
+    chex.assert_trees_all_equal(result.rl_slot_mask, ~result.ea_slot_mask)
+    assert result.final_indices.shape == baseline_indices.shape
+    assert int(result.ea_slot_mask.sum()) == 3
+    assert int(result.rl_slot_mask.sum()) == 3
+    assert int(result.replacement_count) == int(
+        jnp.sum(result.final_indices != baseline_indices)
+    )
+
+
+def test_real_overlay_replacements_are_resident_ea_indices_only():
+    distribution, origin_type, baseline_indices = _overlay_fixture()
+    result = apply_weighted_ea_overlay(
+        baseline_indices, origin_type, distribution, jax.random.key(11)
+    )
+    replacements = result.final_indices[result.ea_slot_mask]
+
+    assert bool(jnp.all(replacements >= 0))
+    assert bool(jnp.all(replacements < 11))
+    chex.assert_trees_all_equal(
+        origin_type[replacements],
+        jnp.full(replacements.shape, EA_ORIGIN, dtype=jnp.int8),
+    )
+
+
+def test_real_overlay_allows_duplicate_replacement():
+    distribution, origin_type, _ = _overlay_fixture()
+    baseline_indices = jnp.zeros((20,), dtype=jnp.int32)
+    result = apply_weighted_ea_overlay(
+        baseline_indices, origin_type, distribution, jax.random.key(12)
+    )
+    replacements = result.final_indices[result.ea_slot_mask]
+
+    assert replacements.shape[0] == 20
+    assert int(jnp.unique(replacements).shape[0]) < replacements.shape[0]
+
+
+def test_real_overlay_fixed_key_is_deterministic_and_advances_key():
+    distribution, origin_type, baseline_indices = _overlay_fixture()
+    key = jax.random.key(13)
+    first = apply_weighted_ea_overlay(
+        baseline_indices, origin_type, distribution, key
+    )
+    second = apply_weighted_ea_overlay(
+        baseline_indices, origin_type, distribution, key
+    )
+
+    chex.assert_trees_all_equal(first, second)
+    assert not bool(jnp.array_equal(first.next_intervention_key, key))
+
+
+def test_real_overlay_no_ea_slot_keeps_indices_and_key():
+    distribution, origin_type, _ = _overlay_fixture()
+    baseline_indices = jnp.asarray([10, 11, 10, 11], dtype=jnp.int32)
+    key = jax.random.key(17)
+    result = apply_weighted_ea_overlay(
+        baseline_indices, origin_type, distribution, key
+    )
+
+    chex.assert_trees_all_equal(result.final_indices, baseline_indices)
+    chex.assert_trees_all_equal(result.next_intervention_key, key)
+    assert int(result.replacement_count) == 0
+
+
+def test_real_overlay_no_resident_ea_keeps_indices_and_key():
+    table = init_source_score_table(4)
+    distribution = build_weighted_source_distribution(
+        table,
+        resident_source_tokens=jnp.full((12,), -1, dtype=jnp.int32),
+        resident_mask=jnp.ones((12,), dtype=jnp.bool_),
+        alpha=0.5,
+        replay_temperature=1.0,
+    )
+    origin_type = jnp.full((12,), EA_ORIGIN, dtype=jnp.int8)
+    baseline_indices = jnp.asarray([0, 1, 2], dtype=jnp.int32)
+    key = jax.random.key(19)
+    result = apply_weighted_ea_overlay(
+        baseline_indices, origin_type, distribution, key
+    )
+
+    chex.assert_trees_all_equal(result.final_indices, baseline_indices)
+    chex.assert_trees_all_equal(result.next_intervention_key, key)
+
+
+def test_real_overlay_eager_and_jit_are_exactly_equal():
+    distribution, origin_type, baseline_indices = _overlay_fixture()
+    key = jax.random.key(23)
+    eager = apply_weighted_ea_overlay(
+        baseline_indices, origin_type, distribution, key
+    )
+    compiled = jax.jit(apply_weighted_ea_overlay)(
+        baseline_indices, origin_type, distribution, key
+    )
+    chex.assert_trees_all_equal(eager, compiled)

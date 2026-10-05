@@ -1,9 +1,4 @@
-"""Pure source-score and baseline-draw overlay primitives for the replay pilot.
-
-Phase 5 adds deterministic freshness and resident eligibility.  It still
-deliberately performs no replacement, weighting, probability calculation, or
-intervention random draw.
-"""
+"""Pure source-score, distribution, and replay-overlay pilot primitives."""
 
 from functools import partial
 from typing import NamedTuple
@@ -105,6 +100,17 @@ class WeightedSourceDistribution(NamedTuple):
 class WeightedSampleResult(NamedTuple):
     sampled_indices: chex.Array
     next_intervention_key: chex.PRNGKey
+
+
+class WeightedReplayOverlay(NamedTuple):
+    """Auditable replacement of only the realized EA slots."""
+
+    baseline_indices: chex.Array
+    final_indices: chex.Array
+    ea_slot_mask: chex.Array
+    rl_slot_mask: chex.Array
+    next_intervention_key: chex.PRNGKey
+    replacement_count: chex.Array
 
 
 def init_source_score_table(capacity: int) -> SourceScoreTable:
@@ -352,6 +358,54 @@ def sample_weighted_ea_indices(
     return WeightedSampleResult(
         sampled_indices=sampled,
         next_intervention_key=next_intervention_key,
+    )
+
+
+def apply_weighted_ea_overlay(
+    baseline_indices: chex.Array,
+    origin_type: chex.Array,
+    distribution: WeightedSourceDistribution,
+    intervention_key: chex.PRNGKey,
+) -> WeightedReplayOverlay:
+    """Replace realized EA slots while freezing every baseline RL index."""
+    ea_slot_mask, rl_slot_mask = build_origin_slot_masks(
+        origin_type, baseline_indices
+    )
+    should_replace = jnp.any(ea_slot_mask) & distribution.has_resident_ea
+
+    def replace(_):
+        sampled = sample_weighted_ea_indices(
+            distribution,
+            intervention_key,
+            sample_size=baseline_indices.shape[0],
+        )
+        candidate = sampled.sampled_indices
+        in_bounds = (candidate >= 0) & (candidate < origin_type.shape[0])
+        safe_candidate = jnp.clip(candidate, 0, origin_type.shape[0] - 1)
+        candidate_is_ea = in_bounds & (origin_type[safe_candidate] == EA_ORIGIN)
+        replacement = jnp.where(
+            candidate_is_ea, safe_candidate, baseline_indices
+        )
+        final_indices = jnp.where(
+            ea_slot_mask, replacement, baseline_indices
+        )
+        return final_indices, sampled.next_intervention_key
+
+    def preserve(_):
+        return baseline_indices, intervention_key
+
+    final_indices, next_intervention_key = jax.lax.cond(
+        should_replace, replace, preserve, operand=None
+    )
+    return WeightedReplayOverlay(
+        baseline_indices=baseline_indices,
+        final_indices=final_indices,
+        ea_slot_mask=ea_slot_mask,
+        rl_slot_mask=rl_slot_mask,
+        next_intervention_key=next_intervention_key,
+        replacement_count=jnp.sum(
+            final_indices != baseline_indices, dtype=jnp.int32
+        ),
     )
 
 
