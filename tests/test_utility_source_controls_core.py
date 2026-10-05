@@ -9,8 +9,10 @@ from evorl.algorithms.erl.erl_td3.utility_source_controls import (
     CheckpointDiagnostic,
     SourceUtilityRecord,
     aggregate_reference_utilities,
+    build_rl_own_source_batch,
     scaled_virtual_critic_utility,
 )
+from evorl.sample_batch import SampleBatch
 
 
 def _quadratic(params, batch, key):
@@ -132,3 +134,76 @@ def test_non_finite_utility_invalidates_checkpoint():
     )
     assert checkpoint.valid is False
     assert "non_finite_utility" in checkpoint.reasons
+
+
+def _rl_raw(num_agents, time, num_envs):
+    markers = jnp.arange(num_agents * time * num_envs, dtype=jnp.float32).reshape(
+        num_agents, time, num_envs
+    )
+    return SampleBatch(
+        obs=markers[..., None],
+        actions=markers[..., None],
+        rewards=markers,
+        dones=jnp.zeros((num_agents, time, num_envs), dtype=jnp.bool_),
+    )
+
+
+def _assert_rl_own_shape(num_agents, num_envs):
+    raw = _rl_raw(num_agents, time=3, num_envs=num_envs)
+    expected_count = num_agents * 3 * num_envs
+    source = build_rl_own_source_batch(
+        raw,
+        generation=7,
+        source_batch_size=expected_count,
+        key=jax.random.key(4),
+    )
+    assert source.source_type == "RL-own"
+    assert source.source_id == "gen_7_rl_own"
+    assert source.valid_transition_count == expected_count
+    assert source.batch.obs.shape == (expected_count, 1)
+    assert set(map(float, source.batch.obs[:, 0])) == set(
+        map(float, raw.obs.reshape(-1))
+    )
+
+
+def test_rl_own_single_agent_single_env_shape():
+    _assert_rl_own_shape(1, 1)
+
+
+def test_rl_own_multi_agent_single_env_shape():
+    _assert_rl_own_shape(2, 1)
+
+
+def test_rl_own_single_agent_multi_env_shape():
+    _assert_rl_own_shape(1, 3)
+
+
+def test_rl_own_multi_agent_multi_env_shape():
+    _assert_rl_own_shape(2, 3)
+
+
+def test_rl_own_shifted_done_excludes_post_terminal_transition():
+    raw = _rl_raw(1, time=3, num_envs=1).replace(
+        dones=jnp.array([[[False], [True], [False]]])
+    )
+    source = build_rl_own_source_batch(
+        raw,
+        generation=8,
+        source_batch_size=2,
+        key=jax.random.key(6),
+    )
+    assert source.valid_transition_count == 2
+    assert set(map(float, source.batch.obs[:, 0])) == {0.0, 1.0}
+
+
+def test_rl_own_insufficient_samples_is_ineligible():
+    source = build_rl_own_source_batch(
+        _rl_raw(1, time=2, num_envs=1),
+        generation=9,
+        source_batch_size=3,
+        key=jax.random.key(5),
+    )
+    assert source.eligible is False
+    assert source.reason == "insufficient_rl_own_samples"
+    assert source.valid_transition_count == 2
+    assert source.batch is None

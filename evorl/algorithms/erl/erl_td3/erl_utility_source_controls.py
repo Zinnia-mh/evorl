@@ -6,12 +6,14 @@ from dataclasses import replace
 import hashlib
 
 import jax
+import jax.tree_util as jtu
 
 from .erl_learner_utility import ERLLearnerUtilityWorkflow
 from .learner_utility import build_source_batches, derive_diagnostic_key
 from .utility_source_controls import (
     FrozenDiagnosticSnapshot,
     SourceControlBatch,
+    build_rl_own_source_batch,
     tree_fingerprint,
 )
 
@@ -20,6 +22,7 @@ SOURCE_CONTROL_TAG = 0x5343
 SOURCE_CONTROL_REFERENCE_TAG = 0x53435246
 SOURCE_CONTROL_REPLAY_RANDOM_TAG = 0x53435252
 SOURCE_CONTROL_EA_TAG = 0x53434541
+SOURCE_CONTROL_RL_OWN_TAG = 0x5343524C
 
 
 def _replay_metadata_fingerprint(replay_state) -> str:
@@ -186,5 +189,67 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                 self._stage_ea_sources,
                 return_trajectory=True,
             )
+        )
+        return eval_metrics, trajectory, replay_buffer_state
+
+    def _stage_rl_own_source(self, raw_trajectory, replay_buffer_state):
+        """Retain one matched source from the real baseline RL rollout."""
+        del replay_buffer_state
+        context = self._diagnostic_context
+        source_key = derive_diagnostic_key(
+            context.key,
+            context.generation,
+            SOURCE_CONTROL_RL_OWN_TAG,
+        )
+        context.rl_source = build_rl_own_source_batch(
+            raw_trajectory,
+            generation=context.generation,
+            source_batch_size=int(self.config.source_batch_size),
+            key=source_key,
+        )
+        return ()
+
+    def _run_deferred_source_control_diagnostic(
+        self, context, rl_source, replay_after_rl
+    ):
+        """Task 7 boundary for four-source evaluation."""
+        del context, rl_source, replay_after_rl
+        return None
+
+    def _rl_rollout(self, agent_state, replay_buffer_state, key):
+        """Stage the real RL rollout and invoke the pre-update deferred boundary."""
+        if not getattr(self, "_diagnostic_active", False):
+            return super()._rl_rollout(agent_state, replay_buffer_state, key)
+
+        eval_metrics, raw_trajectory = jax.vmap(
+            self.rl_collector.rollout,
+            in_axes=(self.agent_state_vmap_axes, 0, None),
+        )(
+            agent_state,
+            jax.random.split(key, self.config.num_rl_agents),
+            self.config.rollout_episodes,
+        )
+        _, trajectory, replay_buffer_state = (
+            self._process_pre_exposure_ec_trajectory(
+                raw_trajectory,
+                replay_buffer_state,
+                self._stage_rl_own_source,
+                return_trajectory=True,
+            )
+        )
+        context = self._diagnostic_context
+        current_critic = jtu.tree_map(
+            lambda leaf: leaf[0], agent_state.params.critic_params
+        )
+        context.source_temporal_alignment = (
+            "exact"
+            if tree_fingerprint(current_critic)
+            == context.snapshot.critic_fingerprint
+            else "delayed"
+        )
+        self._run_deferred_source_control_diagnostic(
+            context,
+            context.rl_source,
+            replay_buffer_state,
         )
         return eval_metrics, trajectory, replay_buffer_state

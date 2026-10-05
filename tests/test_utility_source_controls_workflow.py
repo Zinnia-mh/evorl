@@ -14,6 +14,7 @@ from evorl.algorithms.erl.erl_td3.erl_learner_utility import (
     ERLLearnerUtilityWorkflow,
 )
 from evorl.algorithms.erl.erl_td3.learner_utility import derive_diagnostic_key
+from evorl.algorithms.erl.erl_td3.utility_source_controls import tree_fingerprint
 from evorl.sample_batch import SampleBatch
 from evorl.types import PyTreeDict
 
@@ -70,6 +71,27 @@ class _EAReplay:
         self.add_calls += 1
         self.added = (trajectory, mask)
         return state + 1
+
+
+class _RLCollector:
+    def __init__(self):
+        self.calls = 0
+
+    def rollout(self, agent_state, key, num_episodes):
+        del key, num_episodes
+        self.calls += 1
+        marker = agent_state.params.actor_params["w"][0]
+        metrics = PyTreeDict(
+            episode_returns=jnp.asarray([marker]),
+            episode_lengths=jnp.asarray([2]),
+        )
+        trajectory = SampleBatch(
+            obs=jnp.full((2, 1, 1), marker),
+            actions=jnp.zeros((2, 1, 1)),
+            rewards=jnp.full((2, 1), marker),
+            dones=jnp.zeros((2, 1), dtype=jnp.bool_),
+        )
+        return metrics, trajectory
 
 
 def _state():
@@ -148,6 +170,35 @@ def _ea_workflow(workflow_cls=ERLUtilitySourceControlsWorkflow, *, active=True):
         return ("old-immediate-record",)
 
     workflow._run_pre_exposure_diagnostic = _old_immediate
+    return workflow
+
+
+def _rl_agent_state(critic_value=1.0):
+    params = PyTreeDict(
+        critic_params={"w": jnp.full((2, 1), critic_value)},
+        target_critic_params={"w": jnp.full((2, 1), 3.0)},
+        actor_params={"w": jnp.array([[4.0], [5.0]])},
+        target_actor_params={"w": jnp.array([[6.0], [7.0]])},
+    )
+    return AgentState(params=params, obs_preprocessor_state=None)
+
+
+def _rl_workflow(*, active=True, frozen_critic=1.0):
+    workflow = _ea_workflow(active=active)
+    workflow.rl_collector = _RLCollector()
+    workflow.config.num_rl_agents = 2
+    workflow.config.rollout_episodes = 1
+    workflow._diagnostic_context.snapshot.critic_fingerprint = tree_fingerprint(
+        {"w": jnp.array([frozen_critic])}
+    )
+    workflow._diagnostic_context.ea_sources = ("ea-source",)
+    workflow.deferred_calls = []
+
+    def _deferred(context, rl_source, replay_after_rl):
+        workflow.deferred_calls.append((context, rl_source, replay_after_rl))
+        return None
+
+    workflow._run_deferred_source_control_diagnostic = _deferred
     return workflow
 
 
@@ -375,4 +426,83 @@ def test_ea_source_batch_uses_raw_pre_flatten_trajectory():
     assert (
         workflow._diagnostic_context.snapshot.replay_control_fingerprints
         == before_random
+    )
+
+
+def test_rl_own_uses_baseline_transition_identity():
+    workflow = _rl_workflow()
+    workflow._rl_rollout(_rl_agent_state(), 7, jax.random.key(8))
+    source = workflow._diagnostic_context.rl_source
+    assert source.source_id == "gen_5_rl_own"
+    assert source.valid_transition_count == 4
+    assert set(map(float, source.batch.obs[:, 0])) <= {4.0, 5.0}
+    assert set(map(float, source.batch.obs[:, 0])) <= set(
+        map(float, workflow.replay_buffer.added[0].obs[:, 0])
+    )
+
+
+def test_diagnostic_adds_no_collector_call_or_environment_steps():
+    active = _rl_workflow(active=True)
+    baseline = _rl_workflow(active=False)
+    active_result = active._rl_rollout(_rl_agent_state(), 7, jax.random.key(8))
+    baseline_result = baseline._rl_rollout(_rl_agent_state(), 7, jax.random.key(8))
+    chex.assert_trees_all_equal(active_result, baseline_result)
+    assert active.rl_collector.calls == baseline.rl_collector.calls == 1
+    assert (
+        int(active_result[0].episode_lengths.sum())
+        == int(baseline_result[0].episode_lengths.sum())
+        == 4
+    )
+
+
+def test_rl_replay_insertion_occurs_once():
+    workflow = _rl_workflow()
+    _, _, replay_after = workflow._rl_rollout(
+        _rl_agent_state(), 7, jax.random.key(8)
+    )
+    assert workflow.replay_buffer.add_calls == 1
+    assert replay_after == 8
+
+
+def test_deferred_diagnostic_precedes_real_learner_update():
+    workflow = _rl_workflow()
+    events = []
+    workflow._run_deferred_source_control_diagnostic = (
+        lambda context, rl_source, replay: events.append("deferred")
+    )
+    workflow._rl_rollout(_rl_agent_state(), 7, jax.random.key(8))
+    events.append("real_learner_update")
+    assert events == ["deferred", "real_learner_update"]
+
+
+def test_temporal_alignment_exact_when_critic_unchanged():
+    workflow = _rl_workflow(frozen_critic=1.0)
+    workflow._rl_rollout(_rl_agent_state(1.0), 7, jax.random.key(8))
+    assert workflow._diagnostic_context.source_temporal_alignment == "exact"
+
+
+def test_temporal_alignment_delayed_when_intervening_critic_differs():
+    workflow = _rl_workflow(frozen_critic=1.0)
+    workflow._rl_rollout(_rl_agent_state(2.0), 7, jax.random.key(8))
+    assert workflow._diagnostic_context.source_temporal_alignment == "delayed"
+
+
+def test_rl_rollout_preserves_frozen_controls_and_baseline_key():
+    workflow = _rl_workflow()
+    snapshot = workflow._diagnostic_context.snapshot
+    before = (
+        snapshot.reference_fingerprints,
+        snapshot.replay_control_fingerprints,
+        workflow._diagnostic_context.key,
+        workflow._diagnostic_context.ea_sources,
+    )
+    workflow._rl_rollout(_rl_agent_state(), 7, jax.random.key(8))
+    chex.assert_trees_all_equal(
+        before,
+        (
+            snapshot.reference_fingerprints,
+            snapshot.replay_control_fingerprints,
+            workflow._diagnostic_context.key,
+            workflow._diagnostic_context.ea_sources,
+        ),
     )

@@ -8,11 +8,13 @@ from typing import Any, Callable, Iterable
 
 import chex
 import jax
+import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
 import optax
 
 from evorl.algorithms.erl.erl_td3.learner_utility import UtilityResult
+from evorl.utils.jax_utils import right_shift_with_padding
 
 
 LossFn = Callable[[chex.ArrayTree, Any, chex.PRNGKey], chex.Array]
@@ -115,6 +117,60 @@ class CheckpointDiagnostic:
             warnings=tuple(warnings),
             zero_step_results=tuple(zero_step_results),
         )
+
+
+def build_rl_own_source_batch(
+    raw_trajectory: Any,
+    *,
+    generation: int,
+    source_batch_size: int,
+    key: chex.PRNGKey,
+) -> SourceControlBatch:
+    """Select a matched batch from the one real baseline RL rollout."""
+    if raw_trajectory.dones is None:
+        raise ValueError("raw RL trajectory must include dones")
+    if raw_trajectory.dones.ndim < 3:
+        raise ValueError("raw RL trajectory must have [agent, time, env] dones")
+
+    valid_mask = jax.vmap(
+        lambda dones: jnp.logical_not(right_shift_with_padding(dones, 1))
+    )(raw_trajectory.dones)
+    valid_indices = np.flatnonzero(
+        np.asarray(jax.device_get(valid_mask)).reshape(-1)
+    )
+    valid_count = int(valid_indices.size)
+    source_id = f"gen_{generation}_rl_own"
+    if valid_count < source_batch_size:
+        return SourceControlBatch(
+            source_type="RL-own",
+            source_id=source_id,
+            batch=None,
+            eligible=False,
+            reason="insufficient_rl_own_samples",
+            valid_transition_count=valid_count,
+        )
+
+    chosen = jax.random.choice(
+        key,
+        jnp.asarray(valid_indices),
+        (source_batch_size,),
+        replace=False,
+    )
+
+    def _select(leaf):
+        if leaf is None:
+            return None
+        flattened = leaf.reshape((-1, *leaf.shape[3:]))
+        return flattened[chosen]
+
+    return SourceControlBatch(
+        source_type="RL-own",
+        source_id=source_id,
+        batch=jtu.tree_map(_select, raw_trajectory),
+        eligible=True,
+        reason=None,
+        valid_transition_count=valid_count,
+    )
 
 
 def tree_fingerprint(tree: Any) -> str:
