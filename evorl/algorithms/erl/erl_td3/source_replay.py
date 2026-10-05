@@ -5,6 +5,7 @@ deliberately performs no replacement, weighting, probability calculation, or
 intervention random draw.
 """
 
+from functools import partial
 from typing import NamedTuple
 
 import chex
@@ -79,6 +80,31 @@ class SourceEligibilityResult(NamedTuple):
     eligible: chex.Array
     age: chex.Array
     eligible_count: chex.Array
+
+
+class WeightedSourceDistribution(NamedTuple):
+    """Fixed-shape analytical source and resident-transition distribution."""
+
+    baseline_source_probability: chex.Array
+    weighted_source_probability: chex.Array
+    source_probability: chex.Array
+    transition_probability: chex.Array
+    transition_cdf: chex.Array
+    n_ea: chex.Array
+    eligible_source_count: chex.Array
+    resident_source_count: chex.Array
+    eligible_baseline_mass: chex.Array
+    effective_source_count: chex.Array
+    ess_fraction: chex.Array
+    max_source_probability: chex.Array
+    uniform_floor_per_transition: chex.Array
+    uniform_component_total_mass: chex.Array
+    has_resident_ea: chex.Array
+
+
+class WeightedSampleResult(NamedTuple):
+    sampled_indices: chex.Array
+    next_intervention_key: chex.PRNGKey
 
 
 def init_source_score_table(capacity: int) -> SourceScoreTable:
@@ -168,6 +194,164 @@ def compute_source_eligibility(
         eligible=eligible,
         age=age,
         eligible_count=jnp.sum(eligible, dtype=jnp.int32),
+    )
+
+
+@partial(
+    jax.jit,
+    static_argnames=("alpha", "replay_temperature"),
+)
+def build_weighted_source_distribution(
+    table: SourceScoreTable,
+    resident_source_tokens: chex.Array,
+    resident_mask: chex.Array,
+    alpha: float,
+    replay_temperature: float,
+) -> WeightedSourceDistribution:
+    """Build the bounded Design-v1.1 distribution conditioned on an EA slot.
+
+    ``replay_temperature`` is exclusively the source replay softmax
+    temperature.  This pure primitive does not read TD3 ``tau`` and does not
+    mutate replay contents or the baseline draw.
+    """
+    alpha = float(alpha)
+    replay_temperature = float(replay_temperature)
+    if not np.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha must be finite and within [0, 1]")
+    if not np.isfinite(replay_temperature) or replay_temperature <= 0.0:
+        raise ValueError("replay_temperature must be finite and positive")
+
+    resident_source_tokens = jnp.asarray(resident_source_tokens, dtype=jnp.int32)
+    resident_mask = jnp.asarray(resident_mask, dtype=jnp.bool_)
+    counts = jnp.maximum(table.resident_count, 0).astype(jnp.float32)
+    n_ea = jnp.sum(counts, dtype=jnp.float32)
+    has_resident_ea = n_ea > 0
+    safe_n_ea = jnp.maximum(n_ea, 1.0)
+    baseline = counts / safe_n_ea
+
+    resident_sources = counts > 0
+    eligible = resident_sources & table.weighted_eligible
+    eligible_source_count = jnp.sum(eligible, dtype=jnp.int32)
+    resident_source_count = jnp.sum(resident_sources, dtype=jnp.int32)
+    eligible_baseline_mass = jnp.sum(jnp.where(eligible, baseline, 0.0))
+
+    # Subtract before dividing so even a tiny positive temperature cannot
+    # overflow finite rank-normalized inputs.
+    maximum_eligible_rank = jnp.max(
+        jnp.where(eligible, table.rank_normalized_score, 0.0)
+    )
+    centered_logits = (
+        table.rank_normalized_score - maximum_eligible_rank
+    ) / replay_temperature
+    eligible_exponential = jnp.where(eligible, jnp.exp(centered_logits), 0.0)
+    exponential_total = jnp.sum(eligible_exponential)
+    eligible_softmax = eligible_exponential / jnp.maximum(exponential_total, 1.0)
+    redistributed = jnp.where(
+        eligible,
+        eligible_baseline_mass * eligible_softmax,
+        baseline,
+    )
+    # Empty and singleton eligible sets are exact baseline identities.
+    weighted = jnp.where(eligible_source_count <= 1, baseline, redistributed)
+    mixed = (1.0 - alpha) * baseline + alpha * weighted
+    mixed = jnp.where(~eligible, baseline, mixed)
+    source_probability = jnp.where(
+        (alpha == 0.0) | (eligible_source_count <= 1), baseline, mixed
+    )
+
+    # Map each real resident transition to its table slot without constructing
+    # a source-by-replay matrix.
+    sorted_order = jnp.argsort(table.source_token)
+    sorted_tokens = table.source_token[sorted_order]
+    insertion = jnp.searchsorted(sorted_tokens, resident_source_tokens, side="left")
+    safe_insertion = jnp.clip(insertion, 0, sorted_tokens.shape[0] - 1)
+    source_slot = sorted_order[safe_insertion]
+    mapped_ea = (
+        resident_mask
+        & (resident_source_tokens >= 0)
+        & (sorted_tokens[safe_insertion] == resident_source_tokens)
+        & (table.resident_count[source_slot] > 0)
+    )
+    safe_counts = jnp.maximum(counts, 1.0)
+    uniform_probability = 1.0 / safe_n_ea
+    uniform_floor = (1.0 - alpha) / safe_n_ea
+    weighted_transition = weighted[source_slot] / safe_counts[source_slot]
+    transition_probability = uniform_floor + alpha * weighted_transition
+    transition_probability = jnp.where(
+        ~eligible[source_slot], uniform_probability, transition_probability
+    )
+    transition_probability = jnp.where(
+        (alpha == 0.0) | (eligible_source_count <= 1),
+        uniform_probability,
+        transition_probability,
+    )
+    transition_probability = jnp.where(
+        mapped_ea & has_resident_ea, transition_probability, 0.0
+    ).astype(jnp.float32)
+    transition_cdf = jnp.cumsum(transition_probability)
+    transition_cdf = transition_cdf.at[-1].set(
+        jnp.where(has_resident_ea, jnp.maximum(transition_cdf[-1], 1.0), 0.0)
+    )
+
+    squared_mass = jnp.sum(source_probability**2)
+    effective_source_count = jnp.where(
+        has_resident_ea, 1.0 / jnp.maximum(squared_mass, jnp.finfo(jnp.float32).tiny), 0.0
+    )
+    ess_fraction = jnp.where(
+        resident_source_count > 0,
+        effective_source_count / jnp.maximum(resident_source_count, 1),
+        0.0,
+    )
+    return WeightedSourceDistribution(
+        baseline_source_probability=jnp.where(has_resident_ea, baseline, 0.0),
+        weighted_source_probability=jnp.where(has_resident_ea, weighted, 0.0),
+        source_probability=jnp.where(has_resident_ea, source_probability, 0.0),
+        transition_probability=transition_probability,
+        transition_cdf=transition_cdf,
+        n_ea=n_ea.astype(jnp.int32),
+        eligible_source_count=eligible_source_count,
+        resident_source_count=resident_source_count,
+        eligible_baseline_mass=jnp.where(
+            has_resident_ea, eligible_baseline_mass, 0.0
+        ),
+        effective_source_count=effective_source_count,
+        ess_fraction=ess_fraction,
+        max_source_probability=jnp.where(
+            has_resident_ea, jnp.max(source_probability), 0.0
+        ),
+        uniform_floor_per_transition=jnp.where(
+            has_resident_ea, uniform_floor, 0.0
+        ),
+        uniform_component_total_mass=jnp.where(
+            has_resident_ea, 1.0 - alpha, 0.0
+        ),
+        has_resident_ea=has_resident_ea,
+    )
+
+
+def sample_weighted_ea_indices(
+    distribution: WeightedSourceDistribution,
+    intervention_key: chex.PRNGKey,
+    sample_size: int,
+) -> WeightedSampleResult:
+    """Sample resident EA indices using only a pilot-local intervention key."""
+    sample_size = int(sample_size)
+    if sample_size < 0:
+        raise ValueError("sample_size must be non-negative")
+    sample_key, next_intervention_key = jax.random.split(intervention_key)
+    capacity = distribution.transition_probability.shape[0]
+    safe_cdf = jnp.where(
+        distribution.has_resident_ea,
+        distribution.transition_cdf,
+        jnp.ones((capacity,), dtype=jnp.float32),
+    )
+    draws = jax.random.uniform(sample_key, shape=(sample_size,))
+    sampled = jnp.searchsorted(safe_cdf, draws, side="right").astype(jnp.int32)
+    sampled = jnp.minimum(sampled, capacity - 1)
+    sampled = jnp.where(distribution.has_resident_ea, sampled, -1)
+    return WeightedSampleResult(
+        sampled_indices=sampled,
+        next_intervention_key=next_intervention_key,
     )
 
 

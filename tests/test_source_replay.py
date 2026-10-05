@@ -15,6 +15,7 @@ from evorl.algorithms.erl.erl_td3.source_replay import (
     SCORE_TABLE_ERROR_VERSION,
     SCORE_TABLE_OK,
     apply_checkpoint_score_update,
+    build_weighted_source_distribution,
     build_checkpoint_score_update,
     build_origin_slot_masks,
     compute_source_eligibility,
@@ -24,6 +25,7 @@ from evorl.algorithms.erl.erl_td3.source_replay import (
     raise_for_score_table_status,
     rank_normalize_within_checkpoint,
     source_score_table_nbytes,
+    sample_weighted_ea_indices,
     update_resident_counts,
 )
 from evorl.algorithms.erl.erl_td3.erl_learner_utility import DiagnosticRecord
@@ -664,3 +666,257 @@ def test_negative_window_is_rejected():
 def test_nonpositive_min_resident_is_rejected():
     with pytest.raises(ValueError, match="min_resident"):
         _eligibility(_eligibility_table(), minimum=0)
+
+
+def _sampler_fixture(
+    *,
+    counts=(4, 2, 4, 0),
+    ranks=(0.0, 1.0, 0.5, 0.0),
+    eligible=(True, True, False, False),
+):
+    table = _eligibility_table(
+        tokens=(10, 20, 30, -1),
+        rank=ranks,
+        counts=counts,
+        weighted=eligible,
+    )
+    resident_tokens = jnp.asarray(
+        [10, 10, 10, 10, 20, 20, 30, 30, 30, 30, -1, -1],
+        dtype=jnp.int32,
+    )
+    resident_mask = jnp.asarray(
+        [True] * 11 + [False],
+        dtype=jnp.bool_,
+    )
+    return table, resident_tokens, resident_mask
+
+
+def _distribution(*, alpha=0.5, temperature=1.0, **fixture_kwargs):
+    table, resident_tokens, resident_mask = _sampler_fixture(**fixture_kwargs)
+    return build_weighted_source_distribution(
+        table,
+        resident_source_tokens=resident_tokens,
+        resident_mask=resident_mask,
+        alpha=alpha,
+        replay_temperature=temperature,
+    )
+
+
+def test_source_probabilities_sum_to_one_and_are_finite():
+    result = _distribution()
+    assert jnp.isclose(result.source_probability.sum(), 1.0)
+    assert bool(jnp.all(jnp.isfinite(result.source_probability)))
+    assert bool(jnp.all(result.source_probability >= 0))
+
+
+def test_transition_probabilities_sum_to_one_and_are_finite():
+    result = _distribution()
+    assert jnp.isclose(result.transition_probability.sum(), 1.0)
+    assert bool(jnp.all(jnp.isfinite(result.transition_probability)))
+    assert bool(jnp.all(result.transition_probability >= 0))
+
+
+def test_alpha_zero_distribution_is_exact_baseline_distribution():
+    result = _distribution(alpha=0.0)
+    chex.assert_trees_all_equal(
+        result.source_probability,
+        jnp.asarray([0.4, 0.2, 0.4, 0.0], dtype=jnp.float32),
+    )
+    chex.assert_trees_all_equal(
+        result.transition_probability[:10],
+        jnp.full((10,), 0.1, dtype=jnp.float32),
+    )
+
+
+def test_uniform_floor_is_preserved_per_transition():
+    result = _distribution(alpha=0.5)
+    assert float(result.uniform_floor_per_transition) == pytest.approx(0.05)
+    assert bool(jnp.all(result.transition_probability[:10] >= 0.05))
+
+
+def test_ineligible_source_transition_probability_is_exactly_baseline():
+    result = _distribution(alpha=0.75, temperature=0.4)
+    chex.assert_trees_all_equal(
+        result.transition_probability[6:10],
+        jnp.full((4,), 0.1, dtype=jnp.float32),
+    )
+
+
+def test_tiny_source_below_m_min_is_not_amplified():
+    result = _distribution(counts=(4, 2, 4, 0), eligible=(True, False, True, False))
+    assert float(result.source_probability[1]) == pytest.approx(0.2)
+    chex.assert_trees_all_equal(
+        result.transition_probability[4:6],
+        jnp.full((2,), 0.1, dtype=jnp.float32),
+    )
+
+
+def test_empty_eligible_set_is_uniform_over_ea_transitions():
+    result = _distribution(eligible=(False, False, False, False))
+    chex.assert_trees_all_equal(
+        result.transition_probability[:10],
+        jnp.full((10,), 0.1, dtype=jnp.float32),
+    )
+
+
+def test_single_eligible_source_reduces_to_baseline_mass():
+    result = _distribution(eligible=(False, True, False, False))
+    chex.assert_trees_all_equal(
+        result.source_probability,
+        jnp.asarray([0.4, 0.2, 0.4, 0.0], dtype=jnp.float32),
+    )
+    chex.assert_trees_all_equal(
+        result.transition_probability[:10],
+        jnp.full((10,), 0.1, dtype=jnp.float32),
+    )
+
+
+def test_multiple_eligible_sources_preserve_total_eligible_mass():
+    result = _distribution(alpha=0.8, temperature=0.3)
+    assert float(result.weighted_source_probability[:2].sum()) == pytest.approx(0.6)
+    assert float(result.source_probability[:2].sum()) == pytest.approx(0.6)
+
+
+def test_mixed_eligible_ineligible_sources_preserve_ineligible_mass():
+    result = _distribution(alpha=1.0, temperature=0.2)
+    assert float(result.weighted_source_probability[2]) == pytest.approx(0.4)
+    assert float(result.source_probability[2]) == pytest.approx(0.4)
+
+
+def test_unequal_resident_counts_define_baseline_source_mass():
+    table = _eligibility_table(
+        tokens=(10, 20, 30, -1),
+        counts=(100, 10, 2, 0),
+        weighted=(True, True, False, False),
+    )
+    tokens = jnp.asarray([10] * 100 + [20] * 10 + [30] * 2, dtype=jnp.int32)
+    result = build_weighted_source_distribution(
+        table,
+        resident_source_tokens=tokens,
+        resident_mask=jnp.ones((112,), dtype=jnp.bool_),
+        alpha=0.5,
+        replay_temperature=1.0,
+    )
+    chex.assert_trees_all_close(
+        result.baseline_source_probability,
+        jnp.asarray([100 / 112, 10 / 112, 2 / 112, 0], dtype=jnp.float32),
+    )
+
+
+def test_sampling_is_uniform_within_selected_source():
+    result = _distribution(alpha=0.7, temperature=0.5)
+    assert float(result.transition_probability[0]) == float(
+        result.transition_probability[3]
+    )
+    assert float(result.transition_probability[4]) == float(
+        result.transition_probability[5]
+    )
+
+
+def test_sampler_is_deterministic_for_fixed_key():
+    distribution = _distribution(alpha=0.7, temperature=0.5)
+    key = jax.random.key(2026)
+    first = sample_weighted_ea_indices(distribution, key, sample_size=128)
+    second = sample_weighted_ea_indices(distribution, key, sample_size=128)
+    chex.assert_trees_all_equal(first, second)
+    assert not bool(jnp.array_equal(first.next_intervention_key, key))
+
+
+def test_empirical_sampling_matches_analytical_transition_probability():
+    # Fixed before implementation: seed=2026, draws=50_000, tolerance=0.015.
+    distribution = _distribution(alpha=0.7, temperature=0.5)
+    sampled = sample_weighted_ea_indices(
+        distribution, jax.random.key(2026), sample_size=50_000
+    )
+    empirical = jnp.bincount(sampled.sampled_indices, length=12) / 50_000
+    chex.assert_trees_all_close(
+        empirical,
+        distribution.transition_probability,
+        atol=0.015,
+        rtol=0.0,
+    )
+
+
+def test_extreme_finite_logits_remain_finite():
+    result = _distribution(alpha=1.0, temperature=1e-20)
+    assert bool(jnp.all(jnp.isfinite(result.source_probability)))
+    assert bool(jnp.all(jnp.isfinite(result.transition_probability)))
+    assert jnp.isclose(result.transition_probability.sum(), 1.0)
+
+
+@pytest.mark.parametrize("alpha", [-0.1, 1.1, float("nan"), float("inf")])
+def test_invalid_alpha_is_rejected(alpha):
+    with pytest.raises(ValueError, match="alpha"):
+        _distribution(alpha=alpha)
+
+
+@pytest.mark.parametrize(
+    "temperature", [0.0, -1.0, float("nan"), float("inf")]
+)
+def test_nonpositive_replay_temperature_is_rejected(temperature):
+    with pytest.raises(ValueError, match="replay_temperature"):
+        _distribution(temperature=temperature)
+
+
+def test_no_resident_ea_transition_is_handled_without_nan():
+    table = init_source_score_table(4)
+    result = build_weighted_source_distribution(
+        table,
+        resident_source_tokens=jnp.full((8,), -1, dtype=jnp.int32),
+        resident_mask=jnp.asarray([True] * 4 + [False] * 4),
+        alpha=0.5,
+        replay_temperature=1.0,
+    )
+    assert not bool(result.has_resident_ea)
+    assert float(result.source_probability.sum()) == 0.0
+    assert float(result.transition_probability.sum()) == 0.0
+    assert bool(jnp.all(jnp.isfinite(result.transition_probability)))
+
+
+def test_sampler_reports_required_audit_metrics():
+    result = _distribution(alpha=0.5)
+    assert int(result.n_ea) == 10
+    assert int(result.eligible_source_count) == 2
+    assert int(result.resident_source_count) == 3
+    assert float(result.effective_source_count) == pytest.approx(
+        1.0 / float(jnp.sum(result.source_probability**2))
+    )
+    assert float(result.max_source_probability) == float(
+        jnp.max(result.source_probability)
+    )
+    assert float(result.uniform_component_total_mass) == pytest.approx(0.5)
+    assert float(result.eligible_baseline_mass) == pytest.approx(0.6)
+    assert result.transition_cdf.shape == result.transition_probability.shape
+    assert float(result.transition_cdf[-1]) == pytest.approx(1.0)
+    assert bool(jnp.all(jnp.diff(result.transition_cdf) >= 0))
+
+
+def test_weighted_sampler_eager_and_jit_are_exactly_equal():
+    table, tokens, mask = _sampler_fixture()
+    eager_distribution = build_weighted_source_distribution(
+        table,
+        resident_source_tokens=tokens,
+        resident_mask=mask,
+        alpha=0.7,
+        replay_temperature=0.5,
+    )
+    compiled_distribution = jax.jit(
+        build_weighted_source_distribution,
+        static_argnames=("alpha", "replay_temperature"),
+    )(
+        table,
+        resident_source_tokens=tokens,
+        resident_mask=mask,
+        alpha=0.7,
+        replay_temperature=0.5,
+    )
+    chex.assert_trees_all_equal(eager_distribution, compiled_distribution)
+
+    key = jax.random.key(11)
+    eager_sample = sample_weighted_ea_indices(
+        eager_distribution, key, sample_size=64
+    )
+    compiled_sample = jax.jit(
+        sample_weighted_ea_indices, static_argnames=("sample_size",)
+    )(compiled_distribution, key, sample_size=64)
+    chex.assert_trees_all_equal(eager_sample, compiled_sample)
