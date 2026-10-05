@@ -9,11 +9,19 @@ import jax
 import jax.tree_util as jtu
 
 from .erl_learner_utility import ERLLearnerUtilityWorkflow
-from .learner_utility import build_source_batches, derive_diagnostic_key
+from .learner_utility import (
+    build_source_batches,
+    derive_diagnostic_key,
+    td3_critic_loss,
+)
 from .utility_source_controls import (
+    CheckpointDiagnostic,
     FrozenDiagnosticSnapshot,
     SourceControlBatch,
     build_rl_own_source_batch,
+    compute_source_td_stats,
+    derive_source_update_key,
+    evaluate_frozen_source_controls,
     tree_fingerprint,
 )
 
@@ -212,9 +220,115 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
     def _run_deferred_source_control_diagnostic(
         self, context, rl_source, replay_after_rl
     ):
-        """Task 7 boundary for four-source evaluation."""
-        del context, rl_source, replay_after_rl
-        return None
+        """Evaluate all controls from the one frozen pre-exposure state."""
+        snapshot = context.snapshot
+        if not context.controls_eligible:
+            diagnostic = CheckpointDiagnostic.from_records(
+                checkpoint=context.generation,
+                temporal_alignment=context.source_temporal_alignment,
+                records=(),
+                reasons=(context.controls_reason or "controls_ineligible",),
+            )
+            context.checkpoint_diagnostic = diagnostic
+            self._latest_source_control_diagnostic = diagnostic
+            return diagnostic
+
+        learner_state = snapshot.learner_agent_state
+        critic_params = learner_state.params.critic_params
+        replay_before = _replay_metadata_fingerprint(replay_after_rl)
+        frozen_before = (
+            tree_fingerprint(learner_state),
+            tree_fingerprint(snapshot.critic_opt_state),
+        )
+
+        def loss_fn(params, batch, loss_key):
+            virtual_state = learner_state.replace(
+                params=learner_state.params.replace(critic_params=params)
+            )
+            return td3_critic_loss(self.agent, virtual_state, batch, loss_key)
+
+        replay_sources = tuple(
+            SourceControlBatch(
+                source_type="Replay-random",
+                source_id=f"replay_random_{index}",
+                batch=batch,
+            )
+            for index, batch in enumerate(snapshot.replay_control_batches)
+        )
+        ordinary_sources = (
+            tuple(context.ea_sources) + (rl_source,) + replay_sources
+        )
+        update_key = derive_source_update_key(
+            snapshot.baseline_key, snapshot.generation
+        )
+        td_sources = ordinary_sources + tuple(
+            SourceControlBatch(
+                source_type="Reference-self",
+                source_id=f"reference_self_{index}",
+                batch=batch,
+            )
+            for index, batch in enumerate(snapshot.reference_batches)
+        )
+        td_stats = {
+            source.source_id: compute_source_td_stats(
+                agent=self.agent,
+                frozen_agent_state=learner_state,
+                source_batch=source.batch,
+                source_update_key=update_key,
+            )
+            for source in td_sources
+            if source.eligible
+        }
+        diagnostic = evaluate_frozen_source_controls(
+            checkpoint=context.generation,
+            generation=snapshot.generation,
+            sources=ordinary_sources,
+            reference_batches=snapshot.reference_batches,
+            reference_fingerprints=snapshot.reference_fingerprints,
+            loss_fn=loss_fn,
+            optimizer=self.optimizer,
+            params=critic_params,
+            opt_state=snapshot.critic_opt_state,
+            baseline_key=snapshot.baseline_key,
+            step_scales=tuple(
+                getattr(
+                    self.config,
+                    "source_control_step_scales",
+                    (1.0, 0.5, 0.1),
+                )
+            ),
+            numerical_tolerance=float(
+                getattr(
+                    self.config, "source_control_numerical_tolerance", 1e-6
+                )
+            ),
+            temporal_alignment=context.source_temporal_alignment,
+            td_stats_by_source=td_stats,
+        )
+        reasons = list(diagnostic.reasons)
+        frozen_after = (
+            tree_fingerprint(learner_state),
+            tree_fingerprint(snapshot.critic_opt_state),
+        )
+        if frozen_after != frozen_before:
+            reasons.append("frozen_state_mutation")
+        if _replay_metadata_fingerprint(replay_after_rl) != replay_before:
+            reasons.append("replay_state_mutation")
+        ineligible_reasons = tuple(
+            source.reason
+            for source in ordinary_sources
+            if not source.eligible and source.reason is not None
+        )
+        reasons.extend(ineligible_reasons)
+        if reasons != list(diagnostic.reasons):
+            diagnostic = replace(
+                diagnostic,
+                valid=False,
+                reasons=tuple(dict.fromkeys(reasons)),
+            )
+        context.checkpoint_diagnostic = diagnostic
+        self._latest_source_control_diagnostic = diagnostic
+        return diagnostic
 
     def _rl_rollout(self, agent_state, replay_buffer_state, key):
         """Stage the real RL rollout and invoke the pre-update deferred boundary."""

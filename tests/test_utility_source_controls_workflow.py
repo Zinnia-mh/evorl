@@ -3,9 +3,13 @@ from types import SimpleNamespace
 import chex
 import jax
 import jax.numpy as jnp
+import optax
 import pytest
 
 from evorl.agent import AgentState
+from evorl.algorithms.erl.erl_td3 import (
+    erl_utility_source_controls as workflow_module,
+)
 from evorl.algorithms.erl.erl_td3.erl_utility_source_controls import (
     ERLUtilitySourceControlsWorkflow,
     SOURCE_CONTROL_TAG,
@@ -14,7 +18,10 @@ from evorl.algorithms.erl.erl_td3.erl_learner_utility import (
     ERLLearnerUtilityWorkflow,
 )
 from evorl.algorithms.erl.erl_td3.learner_utility import derive_diagnostic_key
-from evorl.algorithms.erl.erl_td3.utility_source_controls import tree_fingerprint
+from evorl.algorithms.erl.erl_td3.utility_source_controls import (
+    SourceControlBatch,
+    tree_fingerprint,
+)
 from evorl.sample_batch import SampleBatch
 from evorl.types import PyTreeDict
 
@@ -506,3 +513,155 @@ def test_rl_rollout_preserves_frozen_controls_and_baseline_key():
             workflow._diagnostic_context.ea_sources,
         ),
     )
+
+
+class _DiagnosticAgent:
+    def critic_loss(self, agent_state, batch, key):
+        del key
+        value = agent_state.params.critic_params["w"]
+        return SimpleNamespace(critic_loss=jnp.square(value - batch.obs.mean()))
+
+
+class _ReplayWithUnreadableCapacity:
+    current_size = jnp.array(10)
+    current_position = jnp.array(2)
+
+    def __array__(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("diagnostic must not read full replay capacity")
+
+
+def _deferred_workflow_and_context():
+    workflow = object.__new__(ERLUtilitySourceControlsWorkflow)
+    workflow.agent = _DiagnosticAgent()
+    workflow.optimizer = optax.sgd(0.1)
+    workflow.config = SimpleNamespace(
+        source_batch_size=2,
+        source_control_step_scales=(1.0, 0.5, 0.1),
+        source_control_numerical_tolerance=1e-6,
+    )
+    params = PyTreeDict(
+        critic_params={"w": jnp.array(1.0)},
+        target_critic_params={"w": jnp.array(3.0)},
+        actor_params={"w": jnp.array(4.0)},
+        target_actor_params={"w": jnp.array(5.0)},
+    )
+    learner = AgentState(params=params, obs_preprocessor_state=None)
+    opt_state = workflow.optimizer.init(params.critic_params)
+    batch = lambda value: SampleBatch(obs=jnp.full((2, 1), value))
+    snapshot = SimpleNamespace(
+        generation=5,
+        learner_agent_state=learner,
+        critic_opt_state=opt_state,
+        baseline_key=jax.random.key(31),
+        critic_fingerprint=tree_fingerprint(params.critic_params),
+        target_critic_fingerprint=tree_fingerprint(params.target_critic_params),
+        optimizer_fingerprint=tree_fingerprint(opt_state),
+        reference_batches=tuple(batch(v) for v in (0.5, 1.5, 2.5, 3.5)),
+        reference_fingerprints=("r0", "r1", "r2", "r3"),
+        replay_control_batches=(batch(2.0), batch(3.0)),
+    )
+    context = SimpleNamespace(
+        generation=5,
+        snapshot=snapshot,
+        controls_eligible=True,
+        controls_reason=None,
+        ea_sources=(SourceControlBatch("EA", "ea_0", batch(0.0)),),
+        source_temporal_alignment="exact",
+    )
+    rl_source = SourceControlBatch("RL-own", "rl", batch(1.0))
+    replay_state = SimpleNamespace(
+        current_size=jnp.array(10), current_position=jnp.array(2)
+    )
+    return workflow, context, rl_source, replay_state
+
+
+def test_deferred_diagnostic_builds_complete_frozen_matrix_with_td_stats():
+    workflow, context, rl_source, replay_state = _deferred_workflow_and_context()
+    diagnostic = workflow._run_deferred_source_control_diagnostic(
+        context, rl_source, replay_state
+    )
+    assert len(diagnostic.records) == 60
+    assert len(diagnostic.zero_step_results) == 20
+    assert diagnostic.valid is True
+    assert all(record.td_error_mean is not None for record in diagnostic.records)
+    assert context.checkpoint_diagnostic is diagnostic
+    assert workflow._latest_source_control_diagnostic is diagnostic
+
+
+def test_deferred_diagnostic_does_not_mutate_frozen_or_replay_state():
+    workflow, context, rl_source, replay_state = _deferred_workflow_and_context()
+    frozen_before = (
+        tree_fingerprint(context.snapshot.learner_agent_state),
+        tree_fingerprint(context.snapshot.critic_opt_state),
+        tree_fingerprint(replay_state),
+    )
+    workflow._run_deferred_source_control_diagnostic(
+        context, rl_source, replay_state
+    )
+    frozen_after = (
+        tree_fingerprint(context.snapshot.learner_agent_state),
+        tree_fingerprint(context.snapshot.critic_opt_state),
+        tree_fingerprint(replay_state),
+    )
+    assert frozen_after == frozen_before
+
+
+def test_deferred_diagnostic_fingerprints_only_replay_metadata():
+    workflow, context, rl_source, _ = _deferred_workflow_and_context()
+    diagnostic = workflow._run_deferred_source_control_diagnostic(
+        context, rl_source, _ReplayWithUnreadableCapacity()
+    )
+    assert diagnostic.valid is True
+
+
+def test_td_statistics_do_not_depend_on_step_scale():
+    workflow, context, rl_source, replay_state = _deferred_workflow_and_context()
+    records = workflow._run_deferred_source_control_diagnostic(
+        context, rl_source, replay_state
+    ).records
+    for source_id in {record.source_id for record in records}:
+        by_scale = {
+            record.step_scale: (
+                record.td_error_mean,
+                record.td_error_median,
+                record.td_error_std,
+            )
+            for record in records
+            if record.source_id == source_id
+        }
+        assert len(set(by_scale.values())) == 1
+
+
+def test_td_statistics_do_not_depend_on_reference_index():
+    workflow, context, rl_source, replay_state = _deferred_workflow_and_context()
+    records = workflow._run_deferred_source_control_diagnostic(
+        context, rl_source, replay_state
+    ).records
+    for source_id in {record.source_id for record in records}:
+        values = {
+            (
+                record.td_error_mean,
+                record.td_error_median,
+                record.td_error_std,
+            )
+            for record in records
+            if record.source_id == source_id
+        }
+        assert len(values) == 1
+
+
+def test_td_statistics_computed_once_per_source_per_checkpoint(monkeypatch):
+    workflow, context, rl_source, replay_state = _deferred_workflow_and_context()
+    calls = []
+    original = workflow_module.compute_source_td_stats
+
+    def counted(**kwargs):
+        calls.append(kwargs["source_batch"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(workflow_module, "compute_source_td_stats", counted)
+    workflow._run_deferred_source_control_diagnostic(
+        context, rl_source, replay_state
+    )
+    assert len(calls) == 8
