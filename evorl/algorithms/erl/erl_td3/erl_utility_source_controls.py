@@ -227,7 +227,11 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                 checkpoint=context.generation,
                 temporal_alignment=context.source_temporal_alignment,
                 records=(),
-                reasons=(context.controls_reason or "controls_ineligible",),
+                measurement_eligible=False,
+                comparison_eligible=False,
+                eligibility_reasons=(
+                    context.controls_reason or "controls_ineligible",
+                ),
             )
             context.checkpoint_diagnostic = diagnostic
             self._latest_source_control_diagnostic = diagnostic
@@ -314,16 +318,11 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             reasons.append("frozen_state_mutation")
         if _replay_metadata_fingerprint(replay_after_rl) != replay_before:
             reasons.append("replay_state_mutation")
-        ineligible_reasons = tuple(
-            source.reason
-            for source in ordinary_sources
-            if not source.eligible and source.reason is not None
-        )
-        reasons.extend(ineligible_reasons)
         if reasons != list(diagnostic.reasons):
             diagnostic = replace(
                 diagnostic,
                 valid=False,
+                comparison_eligible=False,
                 reasons=tuple(dict.fromkeys(reasons)),
             )
         context.checkpoint_diagnostic = diagnostic

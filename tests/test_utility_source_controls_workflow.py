@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import chex
@@ -665,3 +666,60 @@ def test_td_statistics_computed_once_per_source_per_checkpoint(monkeypatch):
         context, rl_source, replay_state
     )
     assert len(calls) == 8
+
+
+def _run_with_ineligible_rl_own():
+    workflow, context, rl_source, replay_state = _deferred_workflow_and_context()
+    rl_source = replace(
+        rl_source,
+        batch=None,
+        eligible=False,
+        reason="insufficient_rl_own_samples",
+        valid_transition_count=1,
+    )
+    diagnostic = workflow._run_deferred_source_control_diagnostic(
+        context, rl_source, replay_state
+    )
+    return diagnostic
+
+
+def test_rl_own_ineligible_does_not_invalidate_checkpoint():
+    diagnostic = _run_with_ineligible_rl_own()
+    assert diagnostic.valid is True
+    assert diagnostic.measurement_eligible is True
+    assert {record.source_type for record in diagnostic.records} == {
+        "EA",
+        "Replay-random",
+        "Reference-self",
+    }
+
+
+def test_rl_own_ineligible_marks_cross_source_comparison_incomplete():
+    diagnostic = _run_with_ineligible_rl_own()
+    assert diagnostic.comparison_eligible is False
+
+
+def test_source_ineligible_reason_is_preserved():
+    diagnostic = _run_with_ineligible_rl_own()
+    rl_status = next(
+        source
+        for source in diagnostic.source_statuses
+        if source.source_type == "RL-own"
+    )
+    assert rl_status.eligible is False
+    assert rl_status.reason == "insufficient_rl_own_samples"
+    assert diagnostic.eligibility_reasons == ("insufficient_rl_own_samples",)
+
+
+def test_replay_not_ready_is_measurement_ineligible_not_numerical_invalid():
+    workflow, context, rl_source, replay_state = _deferred_workflow_and_context()
+    context.controls_eligible = False
+    context.controls_reason = "replay_not_ready"
+    diagnostic = workflow._run_deferred_source_control_diagnostic(
+        context, rl_source, replay_state
+    )
+    assert diagnostic.valid is True
+    assert diagnostic.measurement_eligible is False
+    assert diagnostic.comparison_eligible is False
+    assert diagnostic.eligibility_reasons == ("replay_not_ready",)
+    assert diagnostic.reasons == ()

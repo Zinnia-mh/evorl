@@ -150,6 +150,10 @@ class CheckpointDiagnostic:
     reasons: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     zero_step_results: tuple[SourceUtilityRecord, ...] = ()
+    measurement_eligible: bool = True
+    comparison_eligible: bool = True
+    eligibility_reasons: tuple[str, ...] = ()
+    source_statuses: tuple[SourceControlBatch, ...] = ()
 
     @classmethod
     def from_records(
@@ -161,6 +165,10 @@ class CheckpointDiagnostic:
         reasons: Iterable[str] = (),
         warnings: Iterable[str] = (),
         zero_step_results: Iterable[SourceUtilityRecord] = (),
+        measurement_eligible: bool = True,
+        comparison_eligible: bool = True,
+        eligibility_reasons: Iterable[str] = (),
+        source_statuses: Iterable[SourceControlBatch] = (),
     ) -> "CheckpointDiagnostic":
         records = tuple(records)
         collected_reasons = list(reasons)
@@ -175,14 +183,21 @@ class CheckpointDiagnostic:
         ):
             collected_reasons.append("non_finite_utility")
         unique_reasons = tuple(dict.fromkeys(collected_reasons))
+        valid = not unique_reasons
         return cls(
             checkpoint=checkpoint,
             temporal_alignment=temporal_alignment,
             records=records,
-            valid=not unique_reasons,
+            valid=valid,
             reasons=unique_reasons,
             warnings=tuple(warnings),
             zero_step_results=tuple(zero_step_results),
+            measurement_eligible=measurement_eligible,
+            comparison_eligible=(
+                valid and measurement_eligible and comparison_eligible
+            ),
+            eligibility_reasons=tuple(dict.fromkeys(eligibility_reasons)),
+            source_statuses=tuple(source_statuses),
         )
 
 
@@ -318,12 +333,34 @@ def evaluate_frozen_source_controls(
     td_stats_by_source: dict[str, TDStats] | None = None,
 ) -> CheckpointDiagnostic:
     """Evaluate every source from one immutable optimizer checkpoint."""
-    sources = tuple(source for source in sources if source.eligible)
+    source_statuses = tuple(sources)
+    sources = tuple(source for source in source_statuses if source.eligible)
     references = tuple(reference_batches)
     fingerprints = tuple(reference_fingerprints)
     scales = tuple(step_scales)
     if len(references) != len(fingerprints):
         raise ValueError("reference batches and fingerprints must align")
+    self_sources = tuple(
+        SourceControlBatch(
+            source_type="Reference-self",
+            source_id=f"reference_self_{reference_index}",
+            batch=reference,
+        )
+        for reference_index, reference in enumerate(references)
+    )
+    all_source_statuses = source_statuses + self_sources
+    eligibility_reasons = tuple(
+        source.reason
+        for source in source_statuses
+        if not source.eligible and source.reason is not None
+    )
+    eligible_types = {source.source_type for source in sources}
+    comparison_eligible = (
+        "EA" in eligible_types
+        and "RL-own" in eligible_types
+        and "Replay-random" in eligible_types
+        and bool(self_sources)
+    )
     batch_sizes = {
         int(jtu.tree_leaves(batch)[0].shape[0])
         for batch in (
@@ -336,6 +373,9 @@ def evaluate_frozen_source_controls(
             temporal_alignment=temporal_alignment,
             records=(),
             reasons=("batch_size_mismatch",),
+            comparison_eligible=comparison_eligible,
+            eligibility_reasons=eligibility_reasons,
+            source_statuses=all_source_statuses,
         )
 
     update_key = derive_source_update_key(baseline_key, generation)
@@ -393,14 +433,6 @@ def evaluate_frozen_source_controls(
         for source in sources
         for reference_index in range(len(references))
     )
-    self_sources = tuple(
-        SourceControlBatch(
-            source_type="Reference-self",
-            source_id=f"reference_self_{reference_index}",
-            batch=reference,
-        )
-        for reference_index, reference in enumerate(references)
-    )
     self_pairs = tuple(
         (source, reference_index)
         for reference_index, source in enumerate(self_sources)
@@ -453,6 +485,9 @@ def evaluate_frozen_source_controls(
         reasons=reasons,
         warnings=warnings,
         zero_step_results=zero_step_results,
+        comparison_eligible=comparison_eligible,
+        eligibility_reasons=eligibility_reasons,
+        source_statuses=all_source_statuses,
     )
 
 

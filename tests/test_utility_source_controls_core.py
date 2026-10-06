@@ -431,7 +431,7 @@ def test_source_reordering_does_not_change_results():
     )
 
 
-def test_non_finite_matrix_utility_invalidates_checkpoint():
+def test_non_finite_still_invalidates_checkpoint():
     def non_finite(params, batch, key):
         del params, batch, key
         return jnp.array(jnp.nan)
@@ -464,7 +464,7 @@ def test_matrix_batch_size_mismatch_rejects_checkpoint():
     assert result.records == ()
 
 
-def test_zero_step_nonfinite_is_hard_gate():
+def test_hard_zero_step_failure_still_invalidates_checkpoint():
     base = optax.sgd(0.1)
     optimizer = optax.GradientTransformation(
         base.init,
@@ -513,3 +513,15 @@ def test_reference_self_negative_is_warning_only():
     )
     assert result.valid is True
     assert "reference_self_negative" in result.warnings
+
+
+def test_frozen_state_mutation_still_invalidates_checkpoint():
+    diagnostic = CheckpointDiagnostic.from_records(
+        checkpoint=5,
+        temporal_alignment="exact",
+        records=(),
+        reasons=("frozen_state_mutation",),
+    )
+    assert diagnostic.valid is False
+    assert diagnostic.measurement_eligible is True
+    assert diagnostic.comparison_eligible is False
