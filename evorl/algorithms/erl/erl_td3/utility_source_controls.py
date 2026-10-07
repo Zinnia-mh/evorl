@@ -402,9 +402,9 @@ def evaluate_frozen_source_controls(
             )
         except FloatingPointError:
             result = UtilityResult(
-                utility=jnp.asarray(jnp.nan),
-                loss_ref_before=jnp.asarray(jnp.nan),
-                loss_ref_after=jnp.asarray(jnp.nan),
+                utility=float("nan"),
+                loss_ref_before=float("nan"),
+                loss_ref_after=float("nan"),
             )
         stats = td_stats_by_source.get(source.source_id)
         batch_size = int(jtu.tree_leaves(source.batch)[0].shape[0])
