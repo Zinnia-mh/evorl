@@ -46,6 +46,10 @@ tmux send-keys -t evorl-conflict-research:source-controls -l \
 
 The verified Task 12 runtime uses Python 3.11.16, JAX/JAXLIB 0.9.0, Flax 0.11.2, and Optax 0.2.8 in `evorl-conflict`. Pre-smoke GPU verification reports JAX backend `gpu`, device NVIDIA GeForce RTX 4090, and driver 550.163.01. A prior transient CUDA/cuSPARSE initialization failure was observed once during provenance inspection but was not reproducible in subsequent normal or `LD_LIBRARY_PATH`-clean runs; no dependency changes were made. The repository-wide historical `tests/test_mjx_env.py` collection issue is pre-existing and is not addressed by this diagnostic.
 
+## Verified Smoke
+
+RUN_ID `swimmer_seed42_20261008T170134` ran Brax/Swimmer with seed 42 on an RTX 4090 using JAX GPU. All 15 due checkpoints were valid and comparison eligible (0 invalid); zero-step, four sources, three scales, four references, eight replay controls, and runtime provenance passed validation. This is smoke validation only, not formal multi-seed evidence.
+
 ## Interpretation limits
 
 Utility is one-step frozen critic learner utility. It is not actor return. It is not long-horizon policy improvement. It does not establish causality.
