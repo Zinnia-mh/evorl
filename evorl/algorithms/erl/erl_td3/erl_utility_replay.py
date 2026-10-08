@@ -1,8 +1,4 @@
-"""Utility-replay pilot with an exact alpha-zero arm and weighted EA overlay.
-
-Phase 7 consumes only explicitly prepared distributions.  Diagnostic score
-lifecycle updates remain intentionally outside this module until Phase 8.
-"""
+"""Utility-replay pilot with pre-exposure diagnostic score lifecycle."""
 
 import time
 from typing import NamedTuple
@@ -24,20 +20,45 @@ from evorl.replay_buffers.source_aware_replay_buffer import (
     make_rl_provenance,
 )
 from evorl.utils.jax_utils import is_jitted, tree_get
+from evorl.utils.jax_utils import right_shift_with_padding, tree_stop_gradient
+from evorl.utils.rl_toolkits import (
+    flatten_pop_rollout_episode,
+    flatten_rollout_trajectory,
+)
 
 from .erl_origin import ERLTrainMetric, ERLWorkflow
+from .erl_learner_utility import ERLLearnerUtilityWorkflow
 from .erl_td3_workflow import (
     ERLTD3WorkflowTemplate,
     create_dummy_td3_trainmetric,
     erl_replace_td3_actor_params,
 )
 from .source_replay import (
+    SCORE_KIND_FITNESS,
+    SCORE_KIND_TD,
+    SCORE_KIND_UTILITY,
+    SCORE_TABLE_OK,
+    SourceScoreTable,
     WeightedReplayOverlay,
     WeightedSourceDistribution,
+    apply_checkpoint_score_update,
     apply_weighted_ea_overlay,
+    build_checkpoint_score_update,
+    build_weighted_source_distribution,
+    compute_source_eligibility,
     draw_baseline_indices,
+    init_source_score_table,
     overlay_ea_indices,
+    raise_for_score_table_status,
+    update_resident_counts,
 )
+
+
+_SCORE_KIND_BY_NAME = {
+    "fitness": SCORE_KIND_FITNESS,
+    "td": SCORE_KIND_TD,
+    "utility": SCORE_KIND_UTILITY,
+}
 
 
 ALLOWED_PILOT_ONLY_PATHS = (
@@ -60,9 +81,17 @@ class AlphaZeroSample(NamedTuple):
 
 class UtilityReplayState(NamedTuple):
     intervention_key: chex.PRNGKey
+    score_table: SourceScoreTable
     distribution: WeightedSourceDistribution
     distribution_prepared: chex.Array
     distribution_version: chex.Array
+    distribution_generation: chex.Array
+
+
+class DiagnosticCheckpointResult(NamedTuple):
+    utility_replay_state: UtilityReplayState
+    score_version: chex.Array
+    applied: bool
 
 
 class WeightedReplaySample(NamedTuple):
@@ -87,7 +116,9 @@ class WeightedReplayDraws(NamedTuple):
 
 
 def init_utility_replay_state(
-    replay_capacity: int, intervention_key: chex.PRNGKey
+    replay_capacity: int,
+    intervention_key: chex.PRNGKey,
+    score_table_capacity: int | None = None,
 ) -> UtilityReplayState:
     """Allocate a fixed-shape inactive distribution for pre-Phase-8 startup."""
     replay_capacity = int(replay_capacity)
@@ -112,9 +143,127 @@ def init_utility_replay_state(
     )
     return UtilityReplayState(
         intervention_key=intervention_key,
+        score_table=init_source_score_table(
+            replay_capacity
+            if score_table_capacity is None
+            else score_table_capacity
+        ),
         distribution=distribution,
         distribution_prepared=jnp.asarray(False),
         distribution_version=jnp.asarray(-1, dtype=jnp.int32),
+        distribution_generation=jnp.asarray(-1, dtype=jnp.int32),
+    )
+
+
+def apply_diagnostic_checkpoint(
+    utility_replay_state: UtilityReplayState,
+    records,
+    *,
+    score_kind: int,
+    population_size: int,
+) -> DiagnosticCheckpointResult:
+    """Install one usable frozen checkpoint before matching EA insertion."""
+    records = tuple(records)
+    if not records:
+        return DiagnosticCheckpointResult(
+            utility_replay_state=utility_replay_state,
+            score_version=jnp.asarray(-1, dtype=jnp.int32),
+            applied=False,
+        )
+    next_version = int(
+        jax.device_get(utility_replay_state.score_table.current_version)
+    ) + 1
+    update = build_checkpoint_score_update(
+        records,
+        score_kind=score_kind,
+        population_size=population_size,
+        version=next_version,
+    )
+    if not bool(jax.device_get(jnp.any(update.validity))):
+        return DiagnosticCheckpointResult(
+            utility_replay_state=utility_replay_state,
+            score_version=jnp.asarray(-1, dtype=jnp.int32),
+            applied=False,
+        )
+    applied = apply_checkpoint_score_update(
+        utility_replay_state.score_table, update
+    )
+    raise_for_score_table_status(applied.status)
+    return DiagnosticCheckpointResult(
+        utility_replay_state=utility_replay_state._replace(
+            score_table=applied.table
+        ),
+        score_version=update.version,
+        applied=True,
+    )
+
+
+def refresh_replay_distribution(
+    utility_replay_state: UtilityReplayState,
+    replay_buffer_state,
+    *,
+    current_generation: int,
+    freshness_window: int,
+    min_resident: int,
+    alpha: float,
+    replay_temperature: float,
+    timing_sink: dict | None = None,
+) -> UtilityReplayState:
+    """Refresh residency, eligibility and distribution after all insertions."""
+    capacity = replay_buffer_state.origin_type.shape[0]
+    indices = jnp.arange(capacity, dtype=jnp.int32)
+    resident = indices < replay_buffer_state.buffer_size
+    resident_ea = resident & (replay_buffer_state.origin_type == EA_ORIGIN)
+    final_tokens = jnp.where(
+        resident_ea, replay_buffer_state.source_token, -1
+    ).astype(jnp.int32)
+    reset_counts = utility_replay_state.score_table._replace(
+        resident_count=jnp.zeros_like(
+            utility_replay_state.score_table.resident_count
+        )
+    )
+    recounted = update_resident_counts(
+        reset_counts,
+        resident_source_tokens=jnp.full((capacity,), -1, dtype=jnp.int32),
+        write_indices=indices,
+        new_source_tokens=final_tokens,
+        mask=resident_ea,
+    )
+    raise_for_score_table_status(recounted.status)
+    eligibility_start = time.perf_counter()
+    eligibility = compute_source_eligibility(
+        recounted.table,
+        current_generation=jnp.asarray(current_generation, dtype=jnp.uint32),
+        freshness_window=freshness_window,
+        min_resident=min_resident,
+    )
+    if timing_sink is not None:
+        timing_sink["eligibility_seconds"] = (
+            time.perf_counter() - eligibility_start
+        )
+    distribution_start = time.perf_counter()
+    distribution = build_weighted_source_distribution(
+        eligibility.table,
+        resident_source_tokens=recounted.resident_source_tokens,
+        resident_mask=resident_ea,
+        alpha=alpha,
+        replay_temperature=replay_temperature,
+    )
+    if timing_sink is not None:
+        timing_sink["distribution_refresh_seconds"] = (
+            time.perf_counter() - distribution_start
+        )
+    return utility_replay_state._replace(
+        score_table=eligibility.table,
+        distribution=distribution,
+        distribution_prepared=(
+            distribution.has_resident_ea
+            & (distribution.eligible_source_count > 0)
+        ),
+        distribution_version=eligibility.table.current_version,
+        distribution_generation=jnp.asarray(
+            current_generation, dtype=jnp.int32
+        ),
     )
 
 
@@ -259,7 +408,12 @@ class UtilityReplayBuffer(SourceAwareReplayBuffer):
 
 
 def make_ea_rollout_provenance(
-    *, generation: int, population_size: int, time_size: int, episode_batch: int
+    *,
+    generation: int,
+    population_size: int,
+    time_size: int,
+    episode_batch: int,
+    score_version: int | chex.Array = NO_SCORE_VERSION,
 ) -> ReplayProvenance:
     """Encode authoritative generation and individual identity for an EA rollout."""
     generation = int(generation)
@@ -280,12 +434,12 @@ def make_ea_rollout_provenance(
             (flat_size,), generation, dtype=jnp.int32
         ),
         score_version=jnp.full(
-            (flat_size,), NO_SCORE_VERSION, dtype=jnp.int32
+            (flat_size,), score_version, dtype=jnp.int32
         ),
     )
 
 
-class ERLUtilityReplayWorkflow(ERLWorkflow):
+class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
     """Original ERL with a provenance-aware alpha-zero replay seam."""
 
     _baseline_ec_rollout = ERLTD3WorkflowTemplate._ec_rollout
@@ -457,6 +611,7 @@ class ERLUtilityReplayWorkflow(ERLWorkflow):
         ec_opt_state = state.ec_opt_state
         replay_buffer_state = state.replay_buffer_state
         utility_replay_state = state.utility_replay_state
+        self._active_utility_replay_state = utility_replay_state
         iterations = state.metrics.iterations + 1
         sampled_timesteps = jnp.zeros((), dtype=jnp.uint32)
         sampled_episodes = jnp.zeros((), dtype=jnp.uint32)
@@ -471,6 +626,7 @@ class ERLUtilityReplayWorkflow(ERLWorkflow):
         ec_eval_metrics, _, replay_buffer_state = self._ec_rollout(
             pop_agent_state, replay_buffer_state, ec_rollout_key
         )
+        utility_replay_state = self._active_utility_replay_state
         sampled_timesteps += ec_eval_metrics.episode_lengths.sum().astype(
             jnp.uint32
         )
@@ -484,6 +640,38 @@ class ERLUtilityReplayWorkflow(ERLWorkflow):
 
         rl_eval_metrics, _, replay_buffer_state = self._rl_rollout(
             agent_state, replay_buffer_state, rl_rollout_key
+        )
+        refresh_start = time.perf_counter()
+        utility_replay_state = refresh_replay_distribution(
+            utility_replay_state,
+            replay_buffer_state,
+            current_generation=int(jax.device_get(iterations)),
+            freshness_window=int(getattr(self.config, "freshness_window", 3)),
+            min_resident=int(getattr(self.config, "min_resident", 1)),
+            alpha=float(self.config.alpha),
+            replay_temperature=float(self.config.replay_temperature),
+            timing_sink=self._latest_score_lifecycle_audit,
+        )
+        self._active_utility_replay_state = utility_replay_state
+        self._latest_score_lifecycle_audit["resident_and_refresh_seconds"] = (
+            time.perf_counter() - refresh_start
+        )
+        self._latest_score_lifecycle_audit["distribution_generation"] = int(
+            jax.device_get(utility_replay_state.distribution_generation)
+        )
+        distribution = utility_replay_state.distribution
+        self._latest_score_lifecycle_audit.update(
+            eligible_source_count=int(
+                jax.device_get(distribution.eligible_source_count)
+            ),
+            n_ea=int(jax.device_get(distribution.n_ea)),
+            max_source_probability=float(
+                jax.device_get(distribution.max_source_probability)
+            ),
+            ess=float(jax.device_get(distribution.effective_source_count)),
+        )
+        self._latest_score_lifecycle_audit["ordering"].append(
+            "distribution_refresh_complete"
         )
         if self.config.rl_updates_mode == "global":
             total_timesteps = (
@@ -506,6 +694,10 @@ class ERLUtilityReplayWorkflow(ERLWorkflow):
             raise ValueError(
                 f"Unknown rl_updates_mode: {self.config.rl_updates_mode}"
             )
+        self._latest_score_lifecycle_audit["ordering"].append(
+            "learner_sampling_start"
+        )
+        learner_start = time.perf_counter()
         (
             td3_metrics,
             agent_state,
@@ -518,6 +710,9 @@ class ERLUtilityReplayWorkflow(ERLWorkflow):
             learn_key,
             num_updates,
             utility_replay_state,
+        )
+        self._latest_score_lifecycle_audit["weighted_learner_phase_seconds"] = (
+            time.perf_counter() - learner_start
         )
         td3_metrics = td3_metrics.replace(
             actor_loss=td3_metrics.actor_loss / self.config.num_rl_agents,
@@ -572,19 +767,45 @@ class ERLUtilityReplayWorkflow(ERLWorkflow):
             opt_state=opt_state,
             utility_replay_state=utility_replay_state,
         )
+        del self._active_utility_replay_state
         return train_metrics, state
 
     def step(self, state):
-        operation = (
-            super().step if float(self.config.alpha) == 0.0
-            else self._weighted_step
-        )
+        if float(self.config.alpha) == 0.0:
+            return self._with_generation_context(state, super().step)
+
+        def operation(current_state):
+            self._latest_score_lifecycle_audit = {
+                "generation": self._generation_from_state(current_state),
+                "ordering": [],
+                "diagnostic_seconds": 0.0,
+                "score_update_seconds": 0.0,
+                "eligibility_seconds": 0.0,
+                "distribution_refresh_seconds": 0.0,
+                "replacement_sampling_seconds": None,
+            }
+            if not self._diagnostic_due(current_state):
+                return self._weighted_step(current_state)
+            self._diagnostic_context = self._make_pre_exposure_context(
+                current_state
+            )
+            self._diagnostic_active = True
+            try:
+                return self._weighted_step(current_state)
+            finally:
+                del self._diagnostic_context
+                del self._diagnostic_active
+
         return self._with_generation_context(state, operation)
 
     def warmup_step(self, state):
         return self._with_generation_context(state, super().warmup_step)
 
     def _ec_rollout(self, agent_state, replay_buffer_state, key):
+        if getattr(self, "_diagnostic_active", False):
+            return ERLLearnerUtilityWorkflow._ec_rollout(
+                self, agent_state, replay_buffer_state, key
+            )
         start_index = replay_buffer_state.current_index
         metrics, trajectory, replay_buffer_state = self._baseline_ec_rollout(
             agent_state, replay_buffer_state, key
@@ -600,6 +821,78 @@ class ERLUtilityReplayWorkflow(ERLWorkflow):
         )
         return metrics, trajectory, replay_buffer_state
 
+    def _process_pre_exposure_ec_trajectory(
+        self,
+        raw_trajectory,
+        replay_buffer_state,
+        diagnostic,
+        *,
+        return_trajectory=False,
+    ):
+        """Score the raw population, then insert it with the matching version."""
+        audit = self._latest_score_lifecycle_audit
+        audit["pre_exposure_buffer_size"] = int(
+            jax.device_get(replay_buffer_state.buffer_size)
+        )
+        audit["pre_exposure_current_index"] = int(
+            jax.device_get(replay_buffer_state.current_index)
+        )
+        audit["ordering"].append("diagnostic_start")
+        diagnostic_start = time.perf_counter()
+        records = diagnostic(raw_trajectory, replay_buffer_state)
+        audit["diagnostic_seconds"] = time.perf_counter() - diagnostic_start
+        audit["ordering"].append("diagnostic_complete")
+
+        score_start = time.perf_counter()
+        score_kind_name = str(getattr(self.config, "score_kind", "utility"))
+        if score_kind_name not in _SCORE_KIND_BY_NAME:
+            raise ValueError(f"unsupported score_kind: {score_kind_name}")
+        checkpoint = apply_diagnostic_checkpoint(
+            self._active_utility_replay_state,
+            records,
+            score_kind=_SCORE_KIND_BY_NAME[score_kind_name],
+            population_size=int(self.config.pop_size),
+        )
+        self._active_utility_replay_state = checkpoint.utility_replay_state
+        audit["score_update_seconds"] = time.perf_counter() - score_start
+        audit["score_version"] = int(jax.device_get(checkpoint.score_version))
+        audit["ordering"].append("score_update_complete")
+
+        trajectory = raw_trajectory.replace(next_obs=None)
+        trajectory = flatten_pop_rollout_episode(trajectory)
+        mask = jnp.logical_not(right_shift_with_padding(trajectory.dones, 1))
+        trajectory = trajectory.replace(dones=None)
+        trajectory, mask = tree_stop_gradient(
+            flatten_rollout_trajectory((trajectory, mask))
+        )
+        flat_size = jtu.tree_leaves(trajectory)[0].shape[0]
+        episode_batch = int(self.config.episodes_for_fitness)
+        time_size = flat_size // (int(self.config.pop_size) * episode_batch)
+        provenance = make_ea_rollout_provenance(
+            generation=self._provenance_generation,
+            population_size=int(self.config.pop_size),
+            time_size=time_size,
+            episode_batch=episode_batch,
+            score_version=checkpoint.score_version,
+        )
+        replay_buffer_state = self.replay_buffer.add(
+            replay_buffer_state, trajectory, provenance, mask
+        )
+        audit["post_ea_buffer_size"] = int(
+            jax.device_get(replay_buffer_state.buffer_size)
+        )
+        audit["post_ea_current_index"] = int(
+            jax.device_get(replay_buffer_state.current_index)
+        )
+        audit["ordering"].append("ea_insertion_complete")
+        audit["reference_fingerprints"] = tuple(
+            sorted({record.reference_fingerprint for record in records})
+        )
+        self._latest_diagnostic_records = records
+        if return_trajectory:
+            return records, trajectory, replay_buffer_state
+        return records, replay_buffer_state
+
     def _rl_rollout(self, agent_state, replay_buffer_state, key):
         start_index = replay_buffer_state.current_index
         metrics, trajectory, replay_buffer_state = self._baseline_rl_rollout(
@@ -614,6 +907,10 @@ class ERLUtilityReplayWorkflow(ERLWorkflow):
             generation=0,
             origin="rl",
         )
+        if hasattr(self, "_latest_score_lifecycle_audit"):
+            self._latest_score_lifecycle_audit["ordering"].append(
+                "rl_insertion_complete"
+            )
         return metrics, trajectory, replay_buffer_state
 
     def _write_rollout_provenance(

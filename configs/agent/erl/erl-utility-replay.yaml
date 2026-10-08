@@ -2,11 +2,17 @@
 
 workflow_cls: evorl.algorithms.erl.erl_td3.erl_utility_replay.ERLUtilityReplayWorkflow
 
-# Phase 3 exact-equivalence arm. Non-zero alpha is intentionally rejected.
+# Arm A keeps diagnostics disabled. Arms B/C/D enable the same frozen
+# checkpoint diagnostic and differ only in score_kind.
 arm: uniform
 score_kind: uniform
 alpha: 0
 replay_temperature: 1.0
+diagnostic_enabled: false
+diagnostic_interval: 1
+source_batch_size: 256
+freshness_window: 3
+min_resident: 4
 
 num_envs: 1
 normalize_obs: false
