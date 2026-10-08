@@ -27,6 +27,22 @@ from evorl.sample_batch import SampleBatch
 from evorl.types import PyTreeDict
 
 
+class _WriterSpy:
+    def __init__(self):
+        self.appended = []
+        self.finalized_checkpoints = 0
+        self.finalized_runs = 0
+
+    def append_checkpoint(self, diagnostic):
+        self.appended.append(diagnostic)
+
+    def finalize_checkpoint(self):
+        self.finalized_checkpoints += 1
+
+    def finalize_run(self):
+        self.finalized_runs += 1
+
+
 class _MarkerReplay:
     def __init__(self, *, sample_batch_size=2, ready=True):
         self.sample_batch_size = sample_batch_size
@@ -590,6 +606,15 @@ def test_deferred_diagnostic_builds_complete_frozen_matrix_with_td_stats():
     assert workflow._latest_source_control_diagnostic is diagnostic
 
 
+def test_null_numerical_tolerance_uses_numeric_default():
+    workflow, context, rl_source, replay_state = _deferred_workflow_and_context()
+    workflow.config.source_control_numerical_tolerance = None
+    diagnostic = workflow._run_deferred_source_control_diagnostic(
+        context, rl_source, replay_state
+    )
+    assert {record.numerical_tolerance for record in diagnostic.records} == {1e-6}
+
+
 def test_deferred_diagnostic_does_not_mutate_frozen_or_replay_state():
     workflow, context, rl_source, replay_state = _deferred_workflow_and_context()
     frozen_before = (
@@ -723,3 +748,150 @@ def test_replay_not_ready_is_measurement_ineligible_not_numerical_invalid():
     assert diagnostic.comparison_eligible is False
     assert diagnostic.eligibility_reasons == ("replay_not_ready",)
     assert diagnostic.reasons == ()
+
+
+def _writer_config(**overrides):
+    values = {
+        "diagnostic_enabled": False,
+        "artifact_root": None,
+        "source_batch_size": 256,
+        "num_reference_batches": 4,
+        "num_random_control_batches": 8,
+        "source_control_step_scales": [1.0, 0.5, 0.1],
+        "source_control_numerical_tolerance": None,
+        "zero_step_tolerance": None,
+        "reference_self_warning_threshold": 0.5,
+        "reference_self_systemic_negative_threshold": 0.5,
+        "ea_mismatch_negative_rate_margin": 0.1,
+        "step_sensitivity_negative_rate_drop": 0.2,
+        "case_b_negative_rate_min": 0.8,
+        "case_b_negative_rate_max": 0.9,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _build_with_parent_stub(monkeypatch, config):
+    workflow = object.__new__(ERLUtilitySourceControlsWorkflow)
+    monkeypatch.setattr(
+        ERLLearnerUtilityWorkflow,
+        "_build_from_config",
+        classmethod(lambda cls, parent_config: workflow),
+    )
+    return ERLUtilitySourceControlsWorkflow._build_from_config(config)
+
+
+def test_enabled_diagnostic_requires_explicit_artifact_root(monkeypatch):
+    with pytest.raises(ValueError, match="artifact_root"):
+        _build_with_parent_stub(
+            monkeypatch,
+            _writer_config(diagnostic_enabled=True),
+        )
+
+
+def test_enabled_writer_created_with_valid_root(monkeypatch, tmp_path):
+    calls = []
+    allowed_root = tmp_path / "outputs"
+    artifact_root = allowed_root / "run-1"
+
+    def writer_factory(root, **kwargs):
+        calls.append((root, kwargs))
+        return _WriterSpy()
+
+    monkeypatch.setattr(workflow_module, "SOURCE_CONTROL_ALLOWED_ARTIFACT_ROOT", allowed_root)
+    monkeypatch.setattr(workflow_module, "UtilitySourceControlArtifactWriter", writer_factory)
+    workflow = _build_with_parent_stub(
+        monkeypatch,
+        _writer_config(diagnostic_enabled=True, artifact_root=str(artifact_root)),
+    )
+    assert isinstance(workflow._source_control_writer, _WriterSpy)
+    assert calls[0][0] == artifact_root
+    assert calls[0][1]["allowed_root"] == allowed_root
+    assert calls[0][1]["run_config"]["num_reference_batches"] == 4
+
+
+def test_disabled_mode_does_not_create_writer(monkeypatch, tmp_path):
+    artifact_root = tmp_path / "must-not-exist"
+
+    def forbidden_writer(*args, **kwargs):
+        raise AssertionError("disabled mode must not create a writer")
+
+    monkeypatch.setattr(workflow_module, "UtilitySourceControlArtifactWriter", forbidden_writer)
+    workflow = _build_with_parent_stub(
+        monkeypatch,
+        _writer_config(artifact_root=str(artifact_root)),
+    )
+    assert workflow._source_control_writer is None
+    assert not artifact_root.exists()
+
+
+def test_checkpoint_diagnostic_is_appended_and_finalized(monkeypatch):
+    workflow = object.__new__(ERLUtilitySourceControlsWorkflow)
+    writer = _WriterSpy()
+    diagnostic = object()
+    workflow.config = SimpleNamespace(diagnostic_interval=1)
+    workflow._diagnostic_enabled = True
+    workflow._source_control_writer = writer
+    workflow._latest_source_control_diagnostic = diagnostic
+    state = SimpleNamespace(metrics=SimpleNamespace(iterations=jnp.array(0)))
+
+    def parent_step(self, current_state):
+        self._latest_source_control_diagnostic = diagnostic
+        return "metrics", current_state
+
+    monkeypatch.setattr(
+        ERLLearnerUtilityWorkflow,
+        "step",
+        parent_step,
+    )
+    assert workflow.step(state) == ("metrics", state)
+    assert writer.appended == [diagnostic]
+    assert writer.finalized_checkpoints == 1
+
+
+def test_due_step_does_not_append_stale_checkpoint(monkeypatch):
+    workflow = object.__new__(ERLUtilitySourceControlsWorkflow)
+    writer = _WriterSpy()
+    workflow.config = SimpleNamespace(diagnostic_interval=1)
+    workflow._diagnostic_enabled = True
+    workflow._source_control_writer = writer
+    workflow._latest_source_control_diagnostic = object()
+    state = SimpleNamespace(metrics=SimpleNamespace(iterations=jnp.array(0)))
+    monkeypatch.setattr(
+        ERLLearnerUtilityWorkflow,
+        "step",
+        lambda self, current_state: ("metrics", current_state),
+    )
+    workflow.step(state)
+    assert writer.appended == []
+
+
+def test_writer_finalize_run_called_once(monkeypatch):
+    workflow = object.__new__(ERLUtilitySourceControlsWorkflow)
+    writer = _WriterSpy()
+    workflow._source_control_writer = writer
+    workflow._source_control_writer_finalized = False
+    parent_closes = []
+    monkeypatch.setattr(
+        ERLLearnerUtilityWorkflow,
+        "close",
+        lambda self: parent_closes.append(True),
+    )
+    workflow.close()
+    workflow.close()
+    assert writer.finalized_runs == 1
+    assert len(parent_closes) == 2
+
+
+def test_ec_rollout_source_control_hook_is_eager():
+    assert not hasattr(ERLUtilitySourceControlsWorkflow._ec_rollout, "lower")
+
+
+def test_rl_rollout_source_control_hook_is_eager():
+    assert not hasattr(ERLUtilitySourceControlsWorkflow._rl_rollout, "lower")
+
+
+def test_host_strings_do_not_enter_jit():
+    diagnostic = _run_with_ineligible_rl_own()
+    assert diagnostic.source_statuses[0].source_type == "EA"
+    assert isinstance(diagnostic.eligibility_reasons[0], str)

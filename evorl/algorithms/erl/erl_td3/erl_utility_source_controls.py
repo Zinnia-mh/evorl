@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+from pathlib import Path
 
 import jax
 import jax.tree_util as jtu
@@ -24,6 +25,7 @@ from .utility_source_controls import (
     evaluate_frozen_source_controls,
     tree_fingerprint,
 )
+from .utility_source_control_artifacts import UtilitySourceControlArtifactWriter
 
 
 SOURCE_CONTROL_TAG = 0x5343
@@ -31,6 +33,13 @@ SOURCE_CONTROL_REFERENCE_TAG = 0x53435246
 SOURCE_CONTROL_REPLAY_RANDOM_TAG = 0x53435252
 SOURCE_CONTROL_EA_TAG = 0x53434541
 SOURCE_CONTROL_RL_OWN_TAG = 0x5343524C
+SOURCE_CONTROL_ALLOWED_ARTIFACT_ROOT = Path(
+    "/disk1/zmh_projects/evorl_utility_source_controls_outputs"
+)
+SOURCE_CONTROL_FORBIDDEN_ROOTS = (
+    Path("/disk1/zmh_projects/evorl"),
+    Path("/disk1/zmh_projects/evorl_utility_source_controls"),
+)
 
 
 def _replay_metadata_fingerprint(replay_state) -> str:
@@ -55,6 +64,103 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
     @classmethod
     def name(cls):
         return "ERL-Utility-Source-Controls"
+
+    @classmethod
+    def enable_jit(cls) -> None:
+        """JIT inherited baseline kernels while leaving host hooks eager."""
+        ERLLearnerUtilityWorkflow.enable_jit()
+
+    @classmethod
+    def _build_from_config(cls, config):
+        workflow = super()._build_from_config(config)
+        workflow._diagnostic_enabled = bool(
+            getattr(config, "diagnostic_enabled", False)
+        )
+        workflow._source_control_writer = None
+        workflow._source_control_writer_finalized = False
+        if not workflow._diagnostic_enabled:
+            return workflow
+
+        artifact_root = getattr(config, "artifact_root", None)
+        if artifact_root is None:
+            raise ValueError(
+                "artifact_root is required when source-control diagnostic is enabled"
+            )
+        workflow._source_control_writer = UtilitySourceControlArtifactWriter(
+            Path(artifact_root),
+            allowed_root=SOURCE_CONTROL_ALLOWED_ARTIFACT_ROOT,
+            forbidden_roots=SOURCE_CONTROL_FORBIDDEN_ROOTS,
+            run_config=cls._source_control_run_config(config),
+        )
+        return workflow
+
+    @staticmethod
+    def _source_control_numerical_tolerance(config):
+        numerical_tolerance = getattr(
+            config, "source_control_numerical_tolerance", None
+        )
+        if numerical_tolerance is None:
+            numerical_tolerance = 1e-6
+        return float(numerical_tolerance)
+
+    @classmethod
+    def _source_control_run_config(cls, config):
+        numerical_tolerance = cls._source_control_numerical_tolerance(config)
+        zero_step_tolerance = getattr(config, "zero_step_tolerance", None)
+        if zero_step_tolerance is None:
+            zero_step_tolerance = numerical_tolerance
+        return {
+            "source_batch_size": int(config.source_batch_size),
+            "num_reference_batches": int(config.num_reference_batches),
+            "num_random_control_batches": int(config.num_random_control_batches),
+            "step_scales": list(config.source_control_step_scales),
+            "numerical_tolerance": float(numerical_tolerance),
+            "zero_step_tolerance": float(zero_step_tolerance),
+            "reference_self_warning_threshold": float(
+                config.reference_self_warning_threshold
+            ),
+            "reference_self_systemic_negative_threshold": float(
+                config.reference_self_systemic_negative_threshold
+            ),
+            "ea_mismatch_negative_rate_margin": float(
+                config.ea_mismatch_negative_rate_margin
+            ),
+            "step_sensitivity_negative_rate_drop": float(
+                config.step_sensitivity_negative_rate_drop
+            ),
+            "case_b_negative_rate_min": float(config.case_b_negative_rate_min),
+            "case_b_negative_rate_max": float(config.case_b_negative_rate_max),
+        }
+
+    def step(self, state):
+        """Persist a due host diagnostic after the unchanged baseline step."""
+        diagnostic_due = self._diagnostic_due(state)
+        if diagnostic_due and hasattr(self, "_latest_source_control_diagnostic"):
+            del self._latest_source_control_diagnostic
+        result = super().step(state)
+        writer = getattr(self, "_source_control_writer", None)
+        if diagnostic_due and writer is not None:
+            diagnostic = getattr(self, "_latest_source_control_diagnostic", None)
+            if diagnostic is not None:
+                writer.append_checkpoint(diagnostic)
+                finalize_checkpoint = getattr(
+                    writer, "finalize_checkpoint", None
+                )
+                if finalize_checkpoint is not None:
+                    finalize_checkpoint()
+        return result
+
+    def close(self) -> None:
+        """Finalize source-control artifacts once during normal shutdown."""
+        try:
+            super().close()
+        finally:
+            writer = getattr(self, "_source_control_writer", None)
+            if writer is not None and not getattr(
+                self, "_source_control_writer_finalized", False
+            ):
+                writer.finalize_run()
+                self._source_control_writer_finalized = True
 
     def _make_pre_exposure_context(self, state):
         context = super()._make_pre_exposure_context(state)
@@ -301,10 +407,8 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                     (1.0, 0.5, 0.1),
                 )
             ),
-            numerical_tolerance=float(
-                getattr(
-                    self.config, "source_control_numerical_tolerance", 1e-6
-                )
+            numerical_tolerance=self._source_control_numerical_tolerance(
+                self.config
             ),
             temporal_alignment=context.source_temporal_alignment,
             td_stats_by_source=td_stats,

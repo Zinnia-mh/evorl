@@ -1,8 +1,10 @@
 import csv
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
+from omegaconf import OmegaConf
 
 from evorl.algorithms.erl.erl_td3.utility_source_control_artifacts import (
     CHECKPOINT_SUMMARY_HEADER,
@@ -474,3 +476,33 @@ def test_run_config_records_common_randomness_policy(tmp_path):
     assert config["reference_eval_key_scope"] == "checkpoint_reference"
     assert config["reference_eval_key_independent_of_source"] is True
     assert config["reference_eval_key_independent_of_step_scale"] is True
+
+
+def _source_control_config():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "agent"
+        / "erl"
+        / "erl-utility-source-controls.yaml"
+    )
+    return OmegaConf.load(path)
+
+
+def test_source_control_config_defaults_disabled():
+    config = _source_control_config()
+    assert config.workflow_cls.endswith(".ERLUtilitySourceControlsWorkflow")
+    assert config.diagnostic_enabled is False
+    assert config.artifact_root is None
+
+
+def test_config_reference_and_control_counts():
+    config = _source_control_config()
+    assert config.source_batch_size == 256
+    assert config.num_reference_batches == 4
+    assert config.num_random_control_batches == 8
+
+
+def test_config_step_scales():
+    config = _source_control_config()
+    assert list(config.source_control_step_scales) == [1.0, 0.5, 0.1]
