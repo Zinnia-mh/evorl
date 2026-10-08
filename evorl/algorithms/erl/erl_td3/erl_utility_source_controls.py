@@ -173,6 +173,22 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             )
         except (FileNotFoundError, subprocess.CalledProcessError, IndexError, ValueError):
             pass
+        python_executable = Path(sys.executable).resolve()
+        conda_prefix = Path(sys.prefix).resolve()
+        conda_env = conda_prefix.name
+        if (
+            conda_prefix.parent.name != "envs"
+            and os.environ.get("CONDA_PREFIX") == str(conda_prefix)
+        ):
+            conda_env = os.environ.get("CONDA_DEFAULT_ENV") or conda_env
+        hydra_env = getattr(config, "env", None)
+        env_type = getattr(hydra_env, "env_type", None)
+        env_name = getattr(hydra_env, "env_name", None)
+        environment = (
+            f"{env_type}/{env_name}"
+            if env_type is not None and env_name is not None
+            else getattr(config, "env_name", getattr(config, "environment", None))
+        )
         run_config.update(
             {
                 "repository_path": str(repository_path),
@@ -192,7 +208,9 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                 "artifact_root": str(Path(config.artifact_root).resolve()),
                 "tmux_session": getattr(config, "tmux_session", None),
                 "tmux_window": getattr(config, "tmux_window", None),
-                "conda_env": os.environ.get("CONDA_DEFAULT_ENV"),
+                "python_executable": str(python_executable),
+                "conda_prefix": str(conda_prefix),
+                "conda_env": conda_env,
                 "python_version": sys.version.split()[0],
                 "jax_version": version("jax"),
                 "jaxlib_version": version("jaxlib"),
@@ -202,9 +220,7 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                 "backend": jax.default_backend(),
                 "gpu_model": gpu_model,
                 "gpu_driver_version": gpu_driver_version,
-                "environment": getattr(
-                    config, "env_name", getattr(config, "environment", None)
-                ),
+                "environment": environment,
                 "seed": (
                     int(config.seed) if getattr(config, "seed", None) is not None else None
                 ),

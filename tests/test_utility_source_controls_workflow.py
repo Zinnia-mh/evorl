@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import pytest
+from omegaconf import OmegaConf
 
 from evorl.agent import AgentState
 from evorl.algorithms.erl.erl_td3 import (
@@ -863,6 +864,35 @@ def test_source_control_run_config_contains_runtime_provenance():
     assert run_config["population"] == 4
     assert run_config["device"]
     assert run_config["backend"]
+
+
+def test_runtime_conda_provenance_uses_interpreter_instead_of_inherited_shell(
+    monkeypatch,
+):
+    monkeypatch.setenv("CONDA_DEFAULT_ENV", "wrong-shell-env")
+    monkeypatch.setenv("CONDA_PREFIX", "/opt/conda/envs/wrong-shell-env")
+    monkeypatch.setattr(
+        workflow_module.sys, "executable", "/opt/conda/envs/actual-env/bin/python"
+    )
+    monkeypatch.setattr(workflow_module.sys, "prefix", "/opt/conda/envs/actual-env")
+
+    config = _writer_config(artifact_root="/outputs/run-1")
+    run_config = ERLUtilitySourceControlsWorkflow._source_control_run_config(config)
+
+    assert run_config["python_executable"] == "/opt/conda/envs/actual-env/bin/python"
+    assert run_config["conda_prefix"] == "/opt/conda/envs/actual-env"
+    assert run_config["conda_env"] == "actual-env"
+
+
+def test_runtime_environment_provenance_reads_nested_hydra_env():
+    config = _writer_config(
+        artifact_root="/outputs/run-1",
+        env=OmegaConf.create({"env_type": "simulator", "env_name": "example"}),
+    )
+
+    run_config = ERLUtilitySourceControlsWorkflow._source_control_run_config(config)
+
+    assert run_config["environment"] == "simulator/example"
 
 
 def test_disabled_mode_does_not_create_writer(monkeypatch, tmp_path):
