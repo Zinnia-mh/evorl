@@ -493,7 +493,7 @@ def test_run_config_persists_complete_static_and_checkpoint_provenance(tmp_path)
         "jaxlib_version": "0.9.0",
         "flax_version": "0.11.2",
         "optax_version": "0.2.8",
-        "device": "TFRT_CPU_0",
+        "device": "runtime-detected-device",
         "environment": "brax/swimmer",
         "seed": 42,
         "population": 4,

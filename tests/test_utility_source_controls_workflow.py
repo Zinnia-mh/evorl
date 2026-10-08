@@ -847,6 +847,9 @@ def test_source_control_run_config_contains_runtime_provenance():
         "flax_version",
         "optax_version",
         "device",
+        "backend",
+        "gpu_model",
+        "gpu_driver_version",
         "environment",
         "seed",
         "population",
@@ -858,6 +861,8 @@ def test_source_control_run_config_contains_runtime_provenance():
     assert run_config["environment"] == "swimmer"
     assert run_config["seed"] == 42
     assert run_config["population"] == 4
+    assert run_config["device"]
+    assert run_config["backend"]
 
 
 def test_disabled_mode_does_not_create_writer(monkeypatch, tmp_path):

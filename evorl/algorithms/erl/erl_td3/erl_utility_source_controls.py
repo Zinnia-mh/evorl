@@ -155,6 +155,24 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
         if not common_dir.is_absolute():
             common_dir = (worktree_path / common_dir).resolve()
         repository_path = common_dir.parent if common_dir.name == ".git" else common_dir
+        gpu_model = None
+        gpu_driver_version = None
+        try:
+            gpu_line = subprocess.run(
+                (
+                    "nvidia-smi",
+                    "--query-gpu=name,driver_version",
+                    "--format=csv,noheader,nounits",
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()[0]
+            gpu_model, gpu_driver_version = (
+                value.strip() for value in gpu_line.split(",", maxsplit=1)
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError, IndexError, ValueError):
+            pass
         run_config.update(
             {
                 "repository_path": str(repository_path),
@@ -181,6 +199,9 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                 "flax_version": version("flax"),
                 "optax_version": version("optax"),
                 "device": ", ".join(str(device) for device in jax.devices()),
+                "backend": jax.default_backend(),
+                "gpu_model": gpu_model,
+                "gpu_driver_version": gpu_driver_version,
                 "environment": getattr(
                     config, "env_name", getattr(config, "environment", None)
                 ),

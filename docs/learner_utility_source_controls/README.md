@@ -44,7 +44,7 @@ tmux send-keys -t evorl-conflict-research:source-controls -l \
   'cd /disk1/zmh_projects/evorl_utility_source_controls && env -u LD_LIBRARY_PATH /home/admin001/anaconda3/envs/evorl-conflict/bin/python scripts/train.py env=brax/swimmer agent=erl/erl-utility-source-controls seed=42 diagnostic_enabled=true diagnostic_interval=1 artifact_root=/disk1/zmh_projects/evorl_utility_source_controls_outputs/smoke/task13 pop_size=4 source_batch_size=64 num_reference_batches=4 num_random_control_batches=8 "source_control_step_scales=[1.0,0.5,0.1]" +tmux_session=evorl-conflict-research +tmux_window=source-controls' Enter
 ```
 
-The verified Task 12 runtime uses Python 3.11.16, JAX/JAXLIB 0.9.0, Flax 0.11.2, and Optax 0.2.8 in `evorl-conflict`. JAX currently reports a CPU device on this host; an RTX 4090 is present, but CUDA initialization reports missing cuSPARSE. The repository-wide historical `tests/test_mjx_env.py` collection issue is pre-existing and is not addressed by this diagnostic.
+The verified Task 12 runtime uses Python 3.11.16, JAX/JAXLIB 0.9.0, Flax 0.11.2, and Optax 0.2.8 in `evorl-conflict`. Pre-smoke GPU verification reports JAX backend `gpu`, device NVIDIA GeForce RTX 4090, and driver 550.163.01. A prior transient CUDA/cuSPARSE initialization failure was observed once during provenance inspection but was not reproducible in subsequent normal or `LD_LIBRARY_PATH`-clean runs; no dependency changes were made. The repository-wide historical `tests/test_mjx_env.py` collection issue is pre-existing and is not addressed by this diagnostic.
 
 ## Interpretation limits
 
