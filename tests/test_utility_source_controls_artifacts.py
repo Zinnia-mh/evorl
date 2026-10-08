@@ -478,6 +478,113 @@ def test_run_config_records_common_randomness_policy(tmp_path):
     assert config["reference_eval_key_independent_of_step_scale"] is True
 
 
+def test_run_config_persists_complete_static_and_checkpoint_provenance(tmp_path):
+    static = {
+        "repository_path": "/repo",
+        "worktree_path": "/worktree",
+        "branch": "research/utility-source-controls",
+        "commit": "abc123",
+        "artifact_root": "/outputs/run-1",
+        "tmux_session": "runtime-session",
+        "tmux_window": "runtime-window",
+        "conda_env": "evorl-conflict",
+        "python_version": "3.11.16",
+        "jax_version": "0.9.0",
+        "jaxlib_version": "0.9.0",
+        "flax_version": "0.11.2",
+        "optax_version": "0.2.8",
+        "device": "TFRT_CPU_0",
+        "environment": "brax/swimmer",
+        "seed": 42,
+        "population": 4,
+        "timestamp": "2026-10-08T00:00:00+00:00",
+    }
+    writer = _writer(tmp_path, **static)
+    writer.append_checkpoint(
+        _diagnostic(1),
+        checkpoint_provenance={
+            "baseline_prng_fingerprint": "prng-1",
+            "replay_metadata_fingerprint": "replay-1",
+            "temporal_alignment": "exact",
+        },
+    )
+    writer.append_checkpoint(
+        _diagnostic(2),
+        checkpoint_provenance={
+            "baseline_prng_fingerprint": "prng-2",
+            "replay_metadata_fingerprint": "replay-2",
+            "temporal_alignment": "delayed",
+        },
+    )
+    config = json.loads((writer.root / "run_config.json").read_text())
+    required = {
+        "repository_path",
+        "worktree_path",
+        "branch",
+        "commit",
+        "artifact_root",
+        "tmux_session",
+        "tmux_window",
+        "conda_env",
+        "python_version",
+        "jax_version",
+        "jaxlib_version",
+        "flax_version",
+        "optax_version",
+        "device",
+        "environment",
+        "seed",
+        "population",
+        "source_batch_size",
+        "num_reference_batches",
+        "num_random_control_batches",
+        "step_scales",
+        "numerical_tolerance",
+        "zero_step_tolerance",
+        "timestamp",
+        "source_update_key_scope",
+        "reference_eval_key_scope",
+        "checkpoint_provenance",
+    }
+    assert required <= config.keys()
+    assert {key: config[key] for key in static} == static
+    assert config["checkpoint_provenance"] == {
+        "1": {
+            "baseline_prng_fingerprint": "prng-1",
+            "replay_metadata_fingerprint": "replay-1",
+            "temporal_alignment": "exact",
+        },
+        "2": {
+            "baseline_prng_fingerprint": "prng-2",
+            "replay_metadata_fingerprint": "replay-2",
+            "temporal_alignment": "delayed",
+        },
+    }
+
+    reopened = UtilitySourceControlArtifactWriter(
+        writer.root,
+        allowed_root=tmp_path / "outputs",
+        forbidden_roots=(),
+        run_config=static
+        | {
+            "source_batch_size": 2,
+            "num_reference_batches": 4,
+            "num_random_control_batches": 1,
+            "step_scales": [1.0, 0.5, 0.1],
+            "numerical_tolerance": 1e-6,
+            "zero_step_tolerance": 1e-6,
+            "reference_self_warning_threshold": 0.0,
+            "ea_mismatch_negative_rate_margin": 0.1,
+            "step_sensitivity_negative_rate_drop": 0.2,
+            "case_b_negative_rate_min": 0.8,
+            "case_b_negative_rate_max": 0.9,
+        },
+    )
+    assert reopened.run_config["checkpoint_provenance"] == config[
+        "checkpoint_provenance"
+    ]
+
+
 def _source_control_config():
     path = (
         Path(__file__).resolve().parents[1]

@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 import hashlib
+from importlib.metadata import version
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import jax
 import jax.tree_util as jtu
@@ -109,7 +114,7 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
         zero_step_tolerance = getattr(config, "zero_step_tolerance", None)
         if zero_step_tolerance is None:
             zero_step_tolerance = numerical_tolerance
-        return {
+        run_config = {
             "source_batch_size": int(config.source_batch_size),
             "num_reference_batches": int(config.num_reference_batches),
             "num_random_control_batches": int(config.num_random_control_batches),
@@ -131,18 +136,85 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             "case_b_negative_rate_min": float(config.case_b_negative_rate_min),
             "case_b_negative_rate_max": float(config.case_b_negative_rate_max),
         }
+        worktree_path = Path(
+            subprocess.run(
+                ("git", "rev-parse", "--show-toplevel"),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        ).resolve()
+        common_dir = Path(
+            subprocess.run(
+                ("git", "rev-parse", "--git-common-dir"),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        if not common_dir.is_absolute():
+            common_dir = (worktree_path / common_dir).resolve()
+        repository_path = common_dir.parent if common_dir.name == ".git" else common_dir
+        run_config.update(
+            {
+                "repository_path": str(repository_path),
+                "worktree_path": str(worktree_path),
+                "branch": subprocess.run(
+                    ("git", "branch", "--show-current"),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                "commit": subprocess.run(
+                    ("git", "rev-parse", "HEAD"),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                "artifact_root": str(Path(config.artifact_root).resolve()),
+                "tmux_session": getattr(config, "tmux_session", None),
+                "tmux_window": getattr(config, "tmux_window", None),
+                "conda_env": os.environ.get("CONDA_DEFAULT_ENV"),
+                "python_version": sys.version.split()[0],
+                "jax_version": version("jax"),
+                "jaxlib_version": version("jaxlib"),
+                "flax_version": version("flax"),
+                "optax_version": version("optax"),
+                "device": ", ".join(str(device) for device in jax.devices()),
+                "environment": getattr(
+                    config, "env_name", getattr(config, "environment", None)
+                ),
+                "seed": (
+                    int(config.seed) if getattr(config, "seed", None) is not None else None
+                ),
+                "population": (
+                    int(config.pop_size)
+                    if getattr(config, "pop_size", None) is not None
+                    else None
+                ),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        return run_config
 
     def step(self, state):
         """Persist a due host diagnostic after the unchanged baseline step."""
         diagnostic_due = self._diagnostic_due(state)
         if diagnostic_due and hasattr(self, "_latest_source_control_diagnostic"):
             del self._latest_source_control_diagnostic
+        if diagnostic_due and hasattr(self, "_latest_source_control_provenance"):
+            del self._latest_source_control_provenance
         result = super().step(state)
         writer = getattr(self, "_source_control_writer", None)
         if diagnostic_due and writer is not None:
             diagnostic = getattr(self, "_latest_source_control_diagnostic", None)
             if diagnostic is not None:
-                writer.append_checkpoint(diagnostic)
+                writer.append_checkpoint(
+                    diagnostic,
+                    checkpoint_provenance=getattr(
+                        self, "_latest_source_control_provenance", None
+                    ),
+                )
                 finalize_checkpoint = getattr(
                     writer, "finalize_checkpoint", None
                 )
@@ -328,6 +400,11 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
     ):
         """Evaluate all controls from the one frozen pre-exposure state."""
         snapshot = context.snapshot
+        self._latest_source_control_provenance = {
+            "baseline_prng_fingerprint": snapshot.baseline_key_fingerprint,
+            "replay_metadata_fingerprint": snapshot.replay_metadata_fingerprint,
+            "temporal_alignment": context.source_temporal_alignment,
+        }
         if not context.controls_eligible:
             diagnostic = CheckpointDiagnostic.from_records(
                 checkpoint=context.generation,

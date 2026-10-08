@@ -298,6 +298,7 @@ class UtilitySourceControlArtifactWriter:
             "step_sensitivity_negative_rate_drop": 0.2,
             "case_b_negative_rate_min": 0.8,
             "case_b_negative_rate_max": 0.9,
+            "checkpoint_provenance": {},
         }
         for key, value in defaults.items():
             self.run_config.setdefault(key, value)
@@ -478,9 +479,20 @@ class UtilitySourceControlArtifactWriter:
             h.flush()
             os.fsync(h.fileno())
 
-    def append_checkpoint(self, d):
+    def append_checkpoint(self, d, *, checkpoint_provenance=None):
         if d.checkpoint in self._checkpoints:
             raise ValueError(f"duplicate checkpoint append: {d.checkpoint}")
+        if checkpoint_provenance is not None:
+            required = {
+                "baseline_prng_fingerprint",
+                "replay_metadata_fingerprint",
+                "temporal_alignment",
+            }
+            missing = required - checkpoint_provenance.keys()
+            if missing:
+                raise ValueError(
+                    "checkpoint provenance missing: " + ", ".join(sorted(missing))
+                )
         byid = {s.source_id: s for s in d.source_statuses}
         raw = []
         for kind, records in (
@@ -519,6 +531,22 @@ class UtilitySourceControlArtifactWriter:
             )
         )
         self._append("source_status.csv", SOURCE_STATUS_HEADER, statuses)
+        if checkpoint_provenance is not None:
+            checkpoint_provenance_by_id = dict(
+                self.run_config.get("checkpoint_provenance", {})
+            )
+            checkpoint_provenance_by_id[str(d.checkpoint)] = {
+                key: checkpoint_provenance[key]
+                for key in (
+                    "baseline_prng_fingerprint",
+                    "replay_metadata_fingerprint",
+                    "temporal_alignment",
+                )
+            }
+            updated_config = dict(self.run_config)
+            updated_config["checkpoint_provenance"] = checkpoint_provenance_by_id
+            self._atomic_json("run_config.json", updated_config)
+            self.run_config = updated_config
         self._diagnostics.append(d)
         self._checkpoints.add(d.checkpoint)
 

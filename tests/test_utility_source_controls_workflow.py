@@ -33,11 +33,13 @@ from evorl.types import PyTreeDict, State
 class _WriterSpy:
     def __init__(self):
         self.appended = []
+        self.provenance = []
         self.finalized_checkpoints = 0
         self.finalized_runs = 0
 
-    def append_checkpoint(self, diagnostic):
+    def append_checkpoint(self, diagnostic, checkpoint_provenance=None):
         self.appended.append(diagnostic)
+        self.provenance.append(checkpoint_provenance)
 
     def finalize_checkpoint(self):
         self.finalized_checkpoints += 1
@@ -574,6 +576,8 @@ def _deferred_workflow_and_context():
         learner_agent_state=learner,
         critic_opt_state=opt_state,
         baseline_key=jax.random.key(31),
+        baseline_key_fingerprint="baseline-key",
+        replay_metadata_fingerprint="replay-metadata",
         critic_fingerprint=tree_fingerprint(params.critic_params),
         target_critic_fingerprint=tree_fingerprint(params.target_critic_params),
         optimizer_fingerprint=tree_fingerprint(opt_state),
@@ -607,6 +611,11 @@ def test_deferred_diagnostic_builds_complete_frozen_matrix_with_td_stats():
     assert all(record.td_error_mean is not None for record in diagnostic.records)
     assert context.checkpoint_diagnostic is diagnostic
     assert workflow._latest_source_control_diagnostic is diagnostic
+    assert workflow._latest_source_control_provenance == {
+        "baseline_prng_fingerprint": context.snapshot.baseline_key_fingerprint,
+        "replay_metadata_fingerprint": context.snapshot.replay_metadata_fingerprint,
+        "temporal_alignment": "exact",
+    }
 
 
 def test_null_numerical_tolerance_uses_numeric_default():
@@ -813,6 +822,44 @@ def test_enabled_writer_created_with_valid_root(monkeypatch, tmp_path):
     assert calls[0][1]["run_config"]["num_reference_batches"] == 4
 
 
+def test_source_control_run_config_contains_runtime_provenance():
+    config = _writer_config(
+        artifact_root="/outputs/run-1",
+        tmux_session="actual-session",
+        tmux_window="actual-window",
+        seed=42,
+        pop_size=4,
+        env_name="swimmer",
+    )
+    run_config = ERLUtilitySourceControlsWorkflow._source_control_run_config(config)
+    required = {
+        "repository_path",
+        "worktree_path",
+        "branch",
+        "commit",
+        "artifact_root",
+        "tmux_session",
+        "tmux_window",
+        "conda_env",
+        "python_version",
+        "jax_version",
+        "jaxlib_version",
+        "flax_version",
+        "optax_version",
+        "device",
+        "environment",
+        "seed",
+        "population",
+        "timestamp",
+    }
+    assert required <= run_config.keys()
+    assert run_config["tmux_session"] == "actual-session"
+    assert run_config["tmux_window"] == "actual-window"
+    assert run_config["environment"] == "swimmer"
+    assert run_config["seed"] == 42
+    assert run_config["population"] == 4
+
+
 def test_disabled_mode_does_not_create_writer(monkeypatch, tmp_path):
     artifact_root = tmp_path / "must-not-exist"
 
@@ -836,10 +883,17 @@ def test_checkpoint_diagnostic_is_appended_and_finalized(monkeypatch):
     workflow._diagnostic_enabled = True
     workflow._source_control_writer = writer
     workflow._latest_source_control_diagnostic = diagnostic
+    provenance = {
+        "baseline_prng_fingerprint": "prng",
+        "replay_metadata_fingerprint": "replay",
+        "temporal_alignment": "exact",
+    }
+    workflow._latest_source_control_provenance = provenance
     state = SimpleNamespace(metrics=SimpleNamespace(iterations=jnp.array(0)))
 
     def parent_step(self, current_state):
         self._latest_source_control_diagnostic = diagnostic
+        self._latest_source_control_provenance = provenance
         return "metrics", current_state
 
     monkeypatch.setattr(
@@ -849,6 +903,7 @@ def test_checkpoint_diagnostic_is_appended_and_finalized(monkeypatch):
     )
     assert workflow.step(state) == ("metrics", state)
     assert writer.appended == [diagnostic]
+    assert writer.provenance == [provenance]
     assert writer.finalized_checkpoints == 1
 
 
