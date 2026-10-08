@@ -9,8 +9,10 @@ import pytest
 
 from evorl.agent import AgentState
 from evorl.algorithms.erl.erl_td3 import (
+    erl_origin as baseline_module,
     erl_utility_source_controls as workflow_module,
 )
+from evorl.algorithms.erl.erl_workflow import WorkflowMetric
 from evorl.algorithms.erl.erl_td3.erl_utility_source_controls import (
     ERLUtilitySourceControlsWorkflow,
     SOURCE_CONTROL_TAG,
@@ -23,8 +25,9 @@ from evorl.algorithms.erl.erl_td3.utility_source_controls import (
     SourceControlBatch,
     tree_fingerprint,
 )
+from evorl.algorithms.td3 import TD3NetworkParams, TD3TrainMetric
 from evorl.sample_batch import SampleBatch
-from evorl.types import PyTreeDict
+from evorl.types import PyTreeDict, State
 
 
 class _WriterSpy:
@@ -895,3 +898,215 @@ def test_host_strings_do_not_enter_jit():
     diagnostic = _run_with_ineligible_rl_own()
     assert diagnostic.source_statuses[0].source_type == "EA"
     assert isinstance(diagnostic.eligibility_reasons[0], str)
+
+
+class _PairedCollector:
+    def __init__(self):
+        self.calls = 0
+        self.environment_steps = 0
+
+    def rollout(self, agent_state, key, num_episodes):
+        del key
+        self.calls += 1
+        self.environment_steps += 2 * int(num_episodes)
+        marker = jnp.asarray(agent_state.params.actor_params["w"]).reshape(-1)[0]
+        metrics = PyTreeDict(
+            episode_returns=jnp.asarray([marker * 10.0]),
+            episode_lengths=jnp.asarray([2]),
+        )
+        trajectory = SampleBatch(
+            obs=jnp.full((2, 1, 1), marker),
+            actions=jnp.full((2, 1, 1), marker / 10.0),
+            rewards=jnp.full((2, 1), marker),
+            next_obs=jnp.full((2, 1, 1), marker + 1.0),
+            dones=jnp.zeros((2, 1), dtype=jnp.bool_),
+        )
+        return metrics, trajectory
+
+
+class _PairedReplay:
+    sample_batch_size = 2
+
+    def __init__(self):
+        self.add_calls = 0
+
+    def can_sample(self, state):
+        del state
+        return True
+
+    def sample(self, state, key):
+        del key
+        return state.data
+
+    def add(self, state, trajectory, mask):
+        del mask
+        self.add_calls += 1
+        added = jnp.uint32(trajectory.obs.shape[0])
+        return state.replace(
+            buffer_size=state.buffer_size + added,
+            current_size=state.current_size + added,
+            current_position=state.current_position + added,
+        )
+
+
+class _PairedECOptimizer:
+    def ask(self, state):
+        return {"w": state.population}, state
+
+    def tell(self, state, fitnesses):
+        return (
+            PyTreeDict(last_fitness=fitnesses),
+            state.replace(
+                generation=state.generation + 1,
+                population=state.population + 0.25,
+                last_fitness=fitnesses,
+            ),
+        )
+
+
+def _paired_workflow_and_state(*, diagnostic_enabled, diagnostic_interval):
+    workflow = object.__new__(ERLUtilitySourceControlsWorkflow)
+    workflow.agent = _DiagnosticAgent()
+    workflow.optimizer = optax.adam(0.1)
+    workflow.ec_optimizer = _PairedECOptimizer()
+    workflow.ec_collector = _PairedCollector()
+    workflow.rl_collector = _PairedCollector()
+    workflow.replay_buffer = _PairedReplay()
+    workflow.agent_state_vmap_axes = 0
+    workflow.config = SimpleNamespace(
+        pop_size=2,
+        episodes_for_fitness=1,
+        num_rl_agents=2,
+        rollout_episodes=1,
+        rl_updates_mode="iter",
+        rl_updates_frac=1.0,
+        actor_update_interval=1,
+        rl_injection_interval=99,
+        source_batch_size=2,
+        num_reference_batches=4,
+        num_random_control_batches=8,
+        source_control_step_scales=(1.0, 0.5, 0.1),
+        source_control_numerical_tolerance=1e-6,
+        diagnostic_enabled=diagnostic_enabled,
+        diagnostic_interval=diagnostic_interval,
+    )
+    workflow._diagnostic_enabled = diagnostic_enabled
+    workflow._source_control_writer = _WriterSpy() if diagnostic_enabled else None
+
+    params = TD3NetworkParams(
+        actor_params={"w": jnp.array([4.0, 5.0])},
+        critic_params={"w": jnp.array([1.0, 2.0])},
+        target_actor_params={"w": jnp.array([6.0, 7.0])},
+        target_critic_params={"w": jnp.array([3.0, 4.0])},
+    )
+    agent_state = AgentState(params=params, obs_preprocessor_state=None)
+    opt_state = PyTreeDict(
+        actor=workflow.optimizer.init(params.actor_params),
+        critic=workflow.optimizer.init(params.critic_params),
+    )
+    replay_state = PyTreeDict(
+        data=SampleBatch(obs=jnp.array([[0.5], [1.5]])),
+        buffer_size=jnp.uint32(2),
+        current_size=jnp.uint32(2),
+        current_position=jnp.uint32(0),
+    )
+    state = State(
+        key=jax.random.key(101),
+        metrics=WorkflowMetric(),
+        agent_state=agent_state,
+        opt_state=opt_state,
+        ec_opt_state=PyTreeDict(
+            generation=jnp.uint32(0),
+            population=jnp.array([10.0, 20.0]),
+            last_fitness=jnp.zeros((2,)),
+        ),
+        replay_buffer_state=replay_state,
+    )
+
+    def rl_update(agent, optimizer_state, replay, key, num_updates):
+        del replay, key, num_updates
+        updated_agent = agent.replace(
+            params=jax.tree_util.tree_map(lambda leaf: leaf + 0.5, agent.params)
+        )
+        updated_optimizer = jax.tree_util.tree_map(
+            lambda leaf: leaf + 1, optimizer_state
+        )
+        metrics = TD3TrainMetric(
+            critic_loss=jnp.array(4.0),
+            actor_loss=jnp.array(2.0),
+            raw_loss_dict=PyTreeDict(
+                critic_loss=jnp.array(4.0),
+                q_value=jnp.array(3.0),
+                actor_loss=jnp.array(2.0),
+            ),
+        )
+        return metrics, updated_agent, updated_optimizer
+
+    workflow._rl_update = rl_update
+    return workflow, state
+
+
+def _assert_paired_step_invariance(monkeypatch, *, diagnostic_interval, due):
+    times = iter((0.0, 1.0, 0.0, 1.0))
+    monkeypatch.setattr(baseline_module.time, "perf_counter", lambda: next(times))
+    off, off_initial = _paired_workflow_and_state(
+        diagnostic_enabled=False,
+        diagnostic_interval=diagnostic_interval,
+    )
+    on, on_initial = _paired_workflow_and_state(
+        diagnostic_enabled=True,
+        diagnostic_interval=diagnostic_interval,
+    )
+
+    chex.assert_trees_all_equal(off_initial, on_initial)
+    off_metrics, off_state = off.step(off_initial)
+    on_metrics, on_state = on.step(on_initial)
+
+    off_params = off_state.agent_state.params
+    on_params = on_state.agent_state.params
+    chex.assert_trees_all_equal(off_params.actor_params, on_params.actor_params)
+    chex.assert_trees_all_equal(off_params.critic_params, on_params.critic_params)
+    chex.assert_trees_all_equal(
+        off_params.target_actor_params, on_params.target_actor_params
+    )
+    chex.assert_trees_all_equal(
+        off_params.target_critic_params, on_params.target_critic_params
+    )
+    chex.assert_trees_all_equal(off_state.opt_state.actor, on_state.opt_state.actor)
+    chex.assert_trees_all_equal(
+        off_state.opt_state.critic, on_state.opt_state.critic
+    )
+    chex.assert_trees_all_equal(off_state.key, on_state.key)
+    chex.assert_trees_all_equal(
+        off_state.replay_buffer_state, on_state.replay_buffer_state
+    )
+    chex.assert_trees_all_equal(off_state.ec_opt_state, on_state.ec_opt_state)
+    chex.assert_trees_all_equal(
+        off_metrics.pop_episode_returns, on_metrics.pop_episode_returns
+    )
+    for field in (
+        "sampled_episodes",
+        "sampled_timesteps",
+        "rl_sampled_timesteps",
+        "iterations",
+    ):
+        chex.assert_trees_all_equal(
+            getattr(off_state.metrics, field), getattr(on_state.metrics, field)
+        )
+    chex.assert_trees_all_equal(off_metrics, on_metrics)
+    assert off.ec_collector.calls == on.ec_collector.calls
+    assert off.rl_collector.calls == on.rl_collector.calls
+    assert off.replay_buffer.add_calls == on.replay_buffer.add_calls
+    assert (
+        off.ec_collector.environment_steps + off.rl_collector.environment_steps
+        == on.ec_collector.environment_steps + on.rl_collector.environment_steps
+    )
+    assert len(on._source_control_writer.appended) == int(due)
+
+
+def test_paired_due_on_off_full_step_baseline_invariance(monkeypatch):
+    _assert_paired_step_invariance(monkeypatch, diagnostic_interval=1, due=True)
+
+
+def test_paired_non_due_on_off_full_step_baseline_invariance(monkeypatch):
+    _assert_paired_step_invariance(monkeypatch, diagnostic_interval=2, due=False)
