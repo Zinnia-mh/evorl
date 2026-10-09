@@ -28,6 +28,7 @@ from evorl.utils.rl_toolkits import (
 
 from .erl_origin import ERLTrainMetric, ERLWorkflow
 from .erl_learner_utility import ERLLearnerUtilityWorkflow
+from .learner_utility import derive_diagnostic_key, td3_critic_loss
 from .erl_td3_workflow import (
     ERLTD3WorkflowTemplate,
     create_dummy_td3_trainmetric,
@@ -59,6 +60,21 @@ _SCORE_KIND_BY_NAME = {
     "td": SCORE_KIND_TD,
     "utility": SCORE_KIND_UTILITY,
 }
+
+EVAL_LOSS_TAG = 0x4556414C
+
+
+def derive_eval_batch_key(baseline_key, generation):
+    """Derive the held-out replay key outside the frozen reference namespace."""
+    root = derive_diagnostic_key(baseline_key, generation, EVAL_LOSS_TAG)
+    return jax.random.split(root)[0]
+
+
+class HeldOutEvalLoss(NamedTuple):
+    loss: float
+    eval_fingerprint: str
+    reference_fingerprint: str
+    generation: int
 
 
 ALLOWED_PILOT_ONLY_PATHS = (
@@ -460,6 +476,41 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
             )
         )
 
+    def _evaluate_optional_loss(self, replay_buffer_state, *, reference_fingerprint):
+        """Read an independently sampled replay batch for a secondary endpoint."""
+        if not bool(getattr(self.config, "enable_eval_loss_endpoint", False)):
+            return None
+        if not reference_fingerprint or not bool(
+            jax.device_get(self.replay_buffer.can_sample(replay_buffer_state))
+        ):
+            return None
+
+        context = self._diagnostic_context
+        batch_key = derive_eval_batch_key(context.key, context.generation)
+        root = derive_diagnostic_key(
+            context.key, context.generation, EVAL_LOSS_TAG
+        )
+        loss_key = jax.random.split(root)[1]
+        for attempt in range(16):
+            eval_batch = self.replay_buffer.sample(
+                replay_buffer_state, jax.random.fold_in(batch_key, attempt)
+            )
+            eval_fingerprint = self._reference_batch_fingerprint(eval_batch)
+            if eval_fingerprint != reference_fingerprint:
+                break
+        else:
+            raise ValueError("held-out eval batch is identical to B_ref")
+
+        loss = td3_critic_loss(
+            self.agent, context.learner_agent_state, eval_batch, loss_key
+        )
+        return HeldOutEvalLoss(
+            loss=float(jax.device_get(loss)),
+            eval_fingerprint=eval_fingerprint,
+            reference_fingerprint=reference_fingerprint,
+            generation=context.generation,
+        )
+
     @classmethod
     def enable_jit(cls) -> None:
         """JIT the unchanged baseline cores; keep sidecar writes host-scoped."""
@@ -857,6 +908,16 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
         audit["score_update_seconds"] = time.perf_counter() - score_start
         audit["score_version"] = int(jax.device_get(checkpoint.score_version))
         audit["ordering"].append("score_update_complete")
+
+        self._latest_eval_loss_endpoint = self._evaluate_optional_loss(
+            replay_buffer_state,
+            reference_fingerprint=(records[0].reference_fingerprint if records else ""),
+        )
+        if self._latest_eval_loss_endpoint is not None:
+            audit["eval_fingerprint"] = (
+                self._latest_eval_loss_endpoint.eval_fingerprint
+            )
+            audit["ordering"].append("eval_loss_complete")
 
         trajectory = raw_trajectory.replace(next_obs=None)
         trajectory = flatten_pop_rollout_episode(trajectory)

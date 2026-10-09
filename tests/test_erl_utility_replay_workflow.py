@@ -857,7 +857,7 @@ def test_rl_overwrite_is_excluded_from_refreshed_distribution():
     assert int(refreshed.distribution_generation) == 1
 
 
-def _phase8_tiny_workflow():
+def _phase8_tiny_workflow(*, enable_eval_loss_endpoint=False):
     overrides = [
         "agent=erl/erl-utility-replay",
         "env=brax/swimmer",
@@ -884,6 +884,7 @@ def _phase8_tiny_workflow():
         "source_batch_size=1",
         "freshness_window=3",
         "min_resident=1",
+        f"enable_eval_loss_endpoint={str(enable_eval_loss_endpoint).lower()}",
     ]
     with initialize(config_path="../configs", version_base=None):
         config = compose(config_name="config", overrides=overrides)
@@ -1115,3 +1116,170 @@ def test_diagnostic_key_does_not_advance_baseline_key(
     chex.assert_trees_all_equal(
         phase8_two_generation_result.state.key, expected
     )
+
+
+@pytest.fixture(scope="module")
+def phase9_comparison_result():
+    states = {}
+    for enabled in (False, True):
+        workflow = _phase8_tiny_workflow(enable_eval_loss_endpoint=enabled)
+        state = workflow.setup(jax.random.PRNGKey(9091))
+        _, state = workflow.step(state)
+        key_before_checkpoint = state.key
+        _, state = workflow.step(state)
+        states[enabled] = SimpleNamespace(
+            workflow=workflow,
+            state=state,
+            key_before_checkpoint=key_before_checkpoint,
+            records=workflow._latest_diagnostic_records,
+            endpoint=getattr(workflow, "_latest_eval_loss_endpoint", None),
+        )
+    return states
+
+
+def test_reference_and_eval_batches_use_independent_keys(
+    phase9_comparison_result,
+):
+    import evorl.algorithms.erl.erl_td3.erl_utility_replay as module
+    from evorl.algorithms.erl.erl_td3.erl_learner_utility import UTILITY_TAG
+    from evorl.algorithms.erl.erl_td3.learner_utility import derive_diagnostic_key
+
+    result = phase9_comparison_result[True]
+    assert callable(getattr(module, "derive_eval_batch_key", None))
+    diagnostic_key = derive_diagnostic_key(
+        result.key_before_checkpoint, 2, UTILITY_TAG
+    )
+    reference_key = jax.random.split(diagnostic_key, 3)[1]
+    eval_key = module.derive_eval_batch_key(result.key_before_checkpoint, 2)
+    assert not bool(jnp.array_equal(reference_key, eval_key))
+    assert not bool(jnp.array_equal(result.state.key, eval_key))
+    assert not bool(jnp.array_equal(
+        result.state.utility_replay_state.intervention_key, eval_key
+    ))
+
+
+def test_reference_and_eval_fingerprints_are_distinct(
+    phase9_comparison_result,
+):
+    result = phase9_comparison_result[True]
+    assert result.endpoint is not None
+    assert result.endpoint.eval_fingerprint
+    assert result.endpoint.eval_fingerprint != result.records[0].reference_fingerprint
+
+
+def test_eval_batch_never_enters_score_computation(phase9_comparison_result):
+    disabled, enabled = phase9_comparison_result[False], phase9_comparison_result[True]
+    assert enabled.records == disabled.records
+    chex.assert_trees_all_equal(
+        enabled.state.utility_replay_state.score_table,
+        disabled.state.utility_replay_state.score_table,
+    )
+    assert enabled.endpoint is not None
+
+
+def test_eval_batch_never_changes_sampling_probabilities(
+    phase9_comparison_result, monkeypatch,
+):
+    disabled, enabled = phase9_comparison_result[False], phase9_comparison_result[True]
+    assert enabled.endpoint is not None
+    chex.assert_trees_all_equal(
+        enabled.state.utility_replay_state.distribution,
+        disabled.state.utility_replay_state.distribution,
+    )
+    chex.assert_trees_all_equal(
+        enabled.state.metrics.sampled_episodes,
+        disabled.state.metrics.sampled_episodes,
+    )
+    chex.assert_trees_all_equal(
+        enabled.state.metrics.sampled_timesteps,
+        disabled.state.metrics.sampled_timesteps,
+    )
+    original_sample = UtilityReplayBuffer.sample
+
+    def shifted_eval_batch(buffer, state, key):
+        batch = original_sample(buffer, state, key)
+        return batch.replace(rewards=batch.rewards + 100.0)
+
+    monkeypatch.setattr(UtilityReplayBuffer, "sample", shifted_eval_batch)
+    workflow = enabled.workflow
+    workflow._diagnostic_context = workflow._make_pre_exposure_context(enabled.state)
+    try:
+        changed = workflow._evaluate_optional_loss(
+            enabled.state.replay_buffer_state,
+            reference_fingerprint=enabled.records[0].reference_fingerprint,
+        )
+    finally:
+        del workflow._diagnostic_context
+    assert changed.eval_fingerprint != enabled.endpoint.eval_fingerprint
+    chex.assert_trees_all_equal(
+        enabled.state.utility_replay_state.distribution,
+        disabled.state.utility_replay_state.distribution,
+    )
+
+
+def test_disabled_eval_endpoint_has_zero_sampling_overhead(
+    phase9_comparison_result,
+):
+    disabled = phase9_comparison_result[False]
+    assert callable(getattr(disabled.workflow, "_evaluate_optional_loss", None))
+    assert disabled.endpoint is None
+    assert disabled.workflow._latest_score_lifecycle_audit.get("eval_fingerprint") is None
+
+
+def test_disabled_eval_endpoint_does_not_sample_replay(
+    phase9_comparison_result, monkeypatch,
+):
+    import evorl.algorithms.erl.erl_td3.erl_utility_replay as module
+
+    disabled = phase9_comparison_result[False]
+    assert callable(getattr(disabled.workflow, "_evaluate_optional_loss", None))
+    def forbidden_sample(*args, **kwargs):
+        pytest.fail("disabled B_eval sampled replay")
+    monkeypatch.setattr(UtilityReplayBuffer, "sample", forbidden_sample)
+    monkeypatch.setattr(module, "td3_critic_loss", forbidden_sample)
+    assert disabled.workflow._evaluate_optional_loss(
+        disabled.state.replay_buffer_state,
+        reference_fingerprint=disabled.records[0].reference_fingerprint,
+    ) is None
+
+
+def test_disabled_eval_endpoint_does_not_advance_eval_key(
+    phase9_comparison_result, monkeypatch,
+):
+    import evorl.algorithms.erl.erl_td3.erl_utility_replay as module
+
+    disabled = phase9_comparison_result[False]
+    assert callable(getattr(disabled.workflow, "_evaluate_optional_loss", None))
+    key_before = disabled.state.key
+    intervention_before = disabled.state.utility_replay_state.intervention_key
+    def forbidden_key(*args, **kwargs):
+        pytest.fail("disabled B_eval derived a key")
+    monkeypatch.setattr(module, "derive_eval_batch_key", forbidden_key)
+    assert disabled.workflow._evaluate_optional_loss(
+        disabled.state.replay_buffer_state,
+        reference_fingerprint=disabled.records[0].reference_fingerprint,
+    ) is None
+    chex.assert_trees_all_equal(disabled.state.key, key_before)
+    chex.assert_trees_all_equal(
+        disabled.state.utility_replay_state.intervention_key, intervention_before
+    )
+
+
+def test_enabled_eval_endpoint_is_read_only(phase9_comparison_result):
+    result = phase9_comparison_result[True]
+    assert callable(getattr(result.workflow, "_evaluate_optional_loss", None))
+    state = result.state
+    snapshot = jtu.tree_map(
+        lambda leaf: leaf.copy() if hasattr(leaf, "copy") else leaf, state
+    )
+    result.workflow._diagnostic_context = result.workflow._make_pre_exposure_context(state)
+    try:
+        endpoint = result.workflow._evaluate_optional_loss(
+            state.replay_buffer_state,
+            reference_fingerprint=result.records[0].reference_fingerprint,
+        )
+    finally:
+        del result.workflow._diagnostic_context
+    assert endpoint is not None
+    assert jnp.isfinite(endpoint.loss)
+    chex.assert_trees_all_equal(state, snapshot)

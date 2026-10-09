@@ -10,6 +10,7 @@ alpha: 0
 replay_temperature: 1.0
 diagnostic_enabled: false
 diagnostic_interval: 1
+enable_eval_loss_endpoint: false
 source_batch_size: 256
 freshness_window: 3
 min_resident: 4
