@@ -168,3 +168,21 @@ class ReplayBuffer(AbstractReplayBuffer):
         batch = tree_get(buffer_state.data, indices)
 
         return batch
+
+    def sample_with_indices(
+        self, buffer_state: ReplayBufferState, key: chex.ArrayTree
+    ) -> tuple[chex.ArrayTree, chex.Array]:
+        """Expose actual uniform sample slots without changing sample().
+
+        Same state/key yields exactly the original with-replacement batch.
+        Indices identify entries only within this immutable state capture;
+        they are not insertion IDs across buffer overwrites.
+        Subclasses with a different sample contract must implement their own
+        indexed sampler instead of silently inheriting uniform semantics.
+        """
+        if type(self).sample is not ReplayBuffer.sample:
+            raise NotImplementedError("indexed sampling requires uniform sample semantics")
+        indices = jax.random.randint(
+            key, (self.sample_batch_size,), minval=0, maxval=buffer_state.buffer_size
+        )
+        return tree_get(buffer_state.data, indices), indices

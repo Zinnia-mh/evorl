@@ -1200,3 +1200,53 @@ def test_paired_due_on_off_full_step_baseline_invariance(monkeypatch):
 
 def test_paired_non_due_on_off_full_step_baseline_invariance(monkeypatch):
     _assert_paired_step_invariance(monkeypatch, diagnostic_interval=2, due=False)
+
+
+@pytest.mark.parametrize("pilot_enabled", [False, True])
+def test_pilot_identity_opt_in_preserves_real_replay_full_step(monkeypatch, pilot_enabled):
+    """Pure identity preparation cannot affect the subsequent real ERL step."""
+    from evorl.replay_buffers.replay_buffer import ReplayBuffer
+    from evorl.algorithms.erl.erl_td3.pilot_transition_identity import (
+        freeze_replay_snapshot, sample_disjoint_replay_groups, derive_pilot_sampling_key,
+    )
+
+    off, off_state = _paired_workflow_and_state(
+        diagnostic_enabled=False, diagnostic_interval=1,
+    )
+    on, on_state = _paired_workflow_and_state(
+        diagnostic_enabled=True, diagnostic_interval=1,
+    )
+    buffer = ReplayBuffer(capacity=64, sample_batch_size=2)
+    spec = SampleBatch(
+        obs=jnp.zeros((1,)), actions=jnp.zeros((1,)),
+        rewards=jnp.array(0.0),
+    )
+    replay = buffer.init(spec)
+    replay = buffer.add(replay, jax.tree_util.tree_map(
+        lambda x: jnp.broadcast_to(x, (32, *x.shape)), spec,
+    ))
+    off.replay_buffer = on.replay_buffer = buffer
+    off_state = off_state.replace(replay_buffer_state=replay)
+    on_state = on_state.replace(replay_buffer_state=replay)
+    chex.assert_trees_all_equal(off_state, on_state)
+    initial_copy = jax.tree_util.tree_map(lambda x: x.copy(), on_state)
+
+    if pilot_enabled:
+        snapshot = freeze_replay_snapshot(replay, run_id="paired", generation=1)
+        groups = sample_disjoint_replay_groups(
+            buffer, snapshot, derive_pilot_sampling_key(on_state.key, generation=1),
+            batch_size=2,
+        )
+        assert groups.eligible and groups.overlap_count == 0
+    chex.assert_trees_all_equal(on_state, initial_copy)
+
+    times = iter((0.0, 1.0, 0.0, 1.0))
+    monkeypatch.setattr(baseline_module.time, "perf_counter", lambda: next(times))
+    off_metrics, off_after = off.step(off_state)
+    on_metrics, on_after = on.step(on_state)
+    # Complete State includes all actor/critic/target params, both optimizer
+    # states, PRNG, replay data/cursors, EC state and all workflow counters.
+    chex.assert_trees_all_equal(off_after, on_after)
+    chex.assert_trees_all_equal(off_metrics, on_metrics)
+    assert off.ec_collector.calls == on.ec_collector.calls == 1
+    assert off.rl_collector.calls == on.rl_collector.calls == 1
