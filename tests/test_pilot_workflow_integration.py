@@ -21,7 +21,7 @@ class Collector:
             obs=jnp.full((8,1,1), value),
             actions=jnp.zeros((8,1,1)),
             rewards=jnp.full((8,1), value),
-            dones=jnp.zeros((8,1), dtype=jnp.bool_),
+            dones=jnp.zeros((8,1), dtype=jnp.float32),
         )
         metrics = PyTreeDict(
             episode_returns=jnp.asarray([value]),

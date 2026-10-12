@@ -243,12 +243,17 @@ def sample_fresh_source(
         raise ValueError("batch_size must be a positive integer")
     dones = raw.dones
     leaves = jtu.tree_leaves(raw)
-    if (dones is None or dones.ndim != 3 or dones.dtype != jnp.bool_
+    if (dones is None or dones.ndim != 3
             or any(leaf.shape[:3] != dones.shape for leaf in leaves)
             or any(dim == 0 for dim in dones.shape)):
         return IdentityBatch(eligible=False, ineligible_reason="invalid_transition_mask")
     host_dones = np.asarray(jax.device_get(dones))
-    if np.any(host_dones[:, :-1, :] & ~host_dones[:, 1:, :]):
+    if (host_dones.dtype.kind not in "biuf"
+            or not np.all(np.isfinite(host_dones))
+            or not np.all((host_dones == 0) | (host_dones == 1))):
+        return IdentityBatch(eligible=False, ineligible_reason="invalid_transition_mask")
+    done_mask = host_dones.astype(bool)
+    if np.any(done_mask[:, :-1, :] & ~done_mask[:, 1:, :]):
         return IdentityBatch(eligible=False, ineligible_reason="invalid_transition_mask")
     actors, time, episodes = dones.shape
     if producer == "EA" and (type(actor_id) is not int or not 0 <= actor_id < actors):

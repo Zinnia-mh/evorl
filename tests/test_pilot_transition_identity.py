@@ -213,7 +213,7 @@ def test_fresh_shifted_mask_and_shortage():
 
 
 @pytest.mark.parametrize("dones", [
-    jnp.zeros((1, 4, 1)),                       # numeric mask
+    jnp.full((1, 4, 1), 0.5),                  # non-binary numeric mask
     jnp.array([[[True], [False], [False], [False]]]),  # non-absorbing no-autoreset layout
 ])
 def test_invalid_transition_mask_fails_closed(dones):
@@ -428,3 +428,34 @@ def test_all_replay_groups_cannot_change_state_under_the_same_capture_id():
     ref = replace(result.references[0], replay_snapshot=capture)
     gate = p.check_disjointness((source,), (ref,), batch_size=2)
     assert not gate.eligible and gate.ineligible_reason == "snapshot_mismatch"
+
+def test_binary_float_brax_done_mask_matches_legacy_fresh_selection():
+    p = pilot()
+    trajectory = raw(1, 8, 1).replace(
+        dones=jnp.array([[[0.], [0.], [0.], [0.], [0.], [0.], [1.], [1.]]])
+    )
+    key = jax.random.key(17)
+    source = p.sample_fresh_source(
+        trajectory, run_id="r", generation=11, producer="RL",
+        actor_id=None, batch_size=4, key=key,
+    )
+    legacy = build_rl_own_source_batch(
+        trajectory, generation=11, source_batch_size=4, key=key,
+    )
+    assert source.eligible
+    assert source.valid_sample_count == 7
+    chex.assert_trees_all_equal(source.batch, legacy.batch)
+    assert {i.time_index for i in source.identities} <= set(range(7))
+
+def test_nonfinite_numeric_done_mask_fails_closed():
+    p = pilot()
+    with jax.debug_nans(False):
+        trajectory = raw(1, 4, 1).replace(
+            dones=jnp.array([[[0.], [jnp.nan], [1.], [1.]]])
+        )
+        selected = p.sample_fresh_source(
+            trajectory, run_id="r", generation=11, producer="RL",
+            actor_id=None, batch_size=2, key=jax.random.key(1),
+        )
+    assert not selected.eligible
+    assert selected.ineligible_reason == "invalid_transition_mask"
