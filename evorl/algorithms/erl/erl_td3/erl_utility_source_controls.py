@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import uuid
 
 import jax
 import jax.tree_util as jtu
@@ -31,6 +32,16 @@ from .utility_source_controls import (
     tree_fingerprint,
 )
 from .utility_source_control_artifacts import UtilitySourceControlArtifactWriter
+from .pilot_transition_identity import (
+    CollectionOrdering, check_disjointness, derive_pilot_sampling_key,
+    freeze_replay_snapshot, sample_disjoint_replay_groups, sample_fresh_source,
+)
+from .pilot_dual_reference import (
+    choose_ea_candidates_and_donors, evaluate_paired_utility,
+    paired_aggregates, sample_rl_heldout,
+)
+from .pilot_artifacts import PILOT_ROOT, PilotArtifactWriter
+from .utility_source_controls import derive_reference_eval_key
 
 
 SOURCE_CONTROL_TAG = 0x5343
@@ -83,6 +94,17 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
         )
         workflow._source_control_writer = None
         workflow._source_control_writer_finalized = False
+        workflow._pilot_enabled = bool(getattr(config, "reference_target_bias_enabled", False))
+        workflow._pilot_writer = None
+        if workflow._pilot_enabled and not workflow._diagnostic_enabled:
+            raise ValueError("Pilot requires diagnostic_enabled")
+        if workflow._pilot_enabled:
+            workflow._pilot_run_id = uuid.uuid4().hex
+            workflow._pilot_writer = PilotArtifactWriter(
+                getattr(config, "pilot_artifact_root", None) or PILOT_ROOT,
+                workflow._pilot_run_id,
+            )
+            return workflow
         if not workflow._diagnostic_enabled:
             return workflow
 
@@ -300,6 +322,41 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
         )
         context.controls_eligible = False
         context.controls_reason = None
+        if getattr(self, "_pilot_enabled", False):
+            context.pilot_run_id = self._pilot_run_id
+            context.pilot_event_counter = 1
+            context.pilot_replay_capture_event = 1
+            context.pilot_snapshot = freeze_replay_snapshot(
+                state.replay_buffer_state,
+                run_id=context.pilot_run_id, generation=context.generation,
+            )
+            batch_size = int(self.config.source_batch_size)
+            if batch_size != int(self.replay_buffer.sample_batch_size):
+                raise ValueError("Pilot replay and source batch sizes must match")
+            if (int(getattr(self.config, "num_reference_batches", 4)) != 4
+                    or int(getattr(self.config, "num_random_control_batches", 8)) != 8):
+                raise ValueError("Pilot requires exactly four Replay references and eight controls")
+            groups = sample_disjoint_replay_groups(
+                self.replay_buffer, context.pilot_snapshot,
+                derive_pilot_sampling_key(context.key, generation=context.generation),
+                batch_size=batch_size,
+                num_references=int(getattr(self.config, "num_reference_batches", 4)),
+                num_controls=int(getattr(self.config, "num_random_control_batches", 8)),
+            )
+            context.pilot_replay_groups = groups
+            context.controls_eligible = groups.eligible
+            context.controls_reason = groups.ineligible_reason
+            if groups.eligible:
+                references = tuple(group.batch for group in groups.references)
+                controls = tuple(group.batch for group in groups.controls)
+                context.snapshot = replace(
+                    context.snapshot,
+                    reference_batches=references,
+                    reference_fingerprints=tuple(tree_fingerprint(x) for x in references),
+                    replay_control_batches=controls,
+                    replay_control_fingerprints=tuple(tree_fingerprint(x) for x in controls),
+                )
+            return context
 
         expected_batch_size = int(self.config.source_batch_size)
         replay_batch_size = int(self.replay_buffer.sample_batch_size)
@@ -368,6 +425,34 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             context.generation,
             SOURCE_CONTROL_EA_TAG,
         )
+        if getattr(self, "_pilot_enabled", False):
+            context.pilot_event_counter += 1
+            context.pilot_ea_capture_event = context.pilot_event_counter
+            context.pilot_ea_raw = raw_trajectory
+            candidate_pairs, donor_pairs, reason = choose_ea_candidates_and_donors(
+                raw_trajectory, context.ea_fitnesses,
+                run_id=context.pilot_run_id, generation=context.generation,
+                batch_size=int(self.config.source_batch_size),
+                source_key=source_key,
+                donor_key=jax.random.fold_in(
+                    derive_pilot_sampling_key(context.key, generation=context.generation),
+                    0x4541444f,
+                ),
+            )
+            context.pilot_ea_reason = reason
+            context.pilot_ea_candidates = candidate_pairs
+            context.pilot_ea_donors = donor_pairs
+            context.ea_sources = tuple(
+                SourceControlBatch(
+                    source_type="EA", source_id=f"gen_{context.generation}_ind_{actor}",
+                    batch=group.batch, eligible=group.eligible,
+                    reason=group.ineligible_reason,
+                    valid_transition_count=group.valid_sample_count,
+                    evolutionary_fitness=float(jax.device_get(context.ea_fitnesses[actor])),
+                )
+                for actor, group in candidate_pairs
+            )
+            return ()
         sources = build_source_batches(
             raw_trajectory,
             generation=context.generation,
@@ -413,6 +498,9 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                 return_trajectory=True,
             )
         )
+        if getattr(self, "_pilot_enabled", False):
+            context.pilot_event_counter += 1
+            context.pilot_ea_insert_event = context.pilot_event_counter
         return eval_metrics, trajectory, replay_buffer_state
 
     def _stage_rl_own_source(self, raw_trajectory, replay_buffer_state):
@@ -424,6 +512,32 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             context.generation,
             SOURCE_CONTROL_RL_OWN_TAG,
         )
+        if getattr(self, "_pilot_enabled", False):
+            context.pilot_event_counter += 1
+            context.pilot_rl_capture_event = context.pilot_event_counter
+            context.pilot_rl_raw = raw_trajectory
+            context.pilot_rl_source = sample_fresh_source(
+                raw_trajectory, run_id=context.pilot_run_id,
+                generation=context.generation, producer="RL", actor_id=None,
+                batch_size=int(self.config.source_batch_size), key=source_key,
+            )
+            context.pilot_rl_references = sample_rl_heldout(
+                raw_trajectory, context.pilot_rl_source,
+                run_id=context.pilot_run_id, generation=context.generation,
+                batch_size=int(self.config.source_batch_size),
+                key=jax.random.fold_in(
+                    derive_pilot_sampling_key(context.key, generation=context.generation),
+                    0x524c5246,
+                ),
+            )
+            context.rl_source = SourceControlBatch(
+                source_type="RL-own", source_id=f"gen_{context.generation}_rl_own",
+                batch=context.pilot_rl_source.batch,
+                eligible=context.pilot_rl_source.eligible,
+                reason=context.pilot_rl_source.ineligible_reason,
+                valid_transition_count=context.pilot_rl_source.valid_sample_count,
+            )
+            return ()
         context.rl_source = build_rl_own_source_batch(
             raw_trajectory,
             generation=context.generation,
@@ -436,6 +550,8 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
         self, context, rl_source, replay_after_rl
     ):
         """Evaluate all controls from the one frozen pre-exposure state."""
+        if getattr(self, "_pilot_enabled", False):
+            return self._run_deferred_pilot_diagnostic(context, rl_source, replay_after_rl)
         snapshot = context.snapshot
         self._latest_source_control_provenance = {
             "baseline_prng_fingerprint": snapshot.baseline_key_fingerprint,
@@ -569,6 +685,9 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             )
         )
         context = self._diagnostic_context
+        if getattr(self, "_pilot_enabled", False):
+            context.pilot_event_counter += 1
+            context.pilot_rl_insert_event = context.pilot_event_counter
         current_critic = jtu.tree_map(
             lambda leaf: leaf[0], agent_state.params.critic_params
         )
@@ -584,3 +703,185 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             replay_buffer_state,
         )
         return eval_metrics, trajectory, replay_buffer_state
+
+    def _run_deferred_pilot_diagnostic(self, context, rl_source, replay_after_rl):
+        """Validate physical captures before any paired virtual update."""
+        snapshot = context.snapshot
+        batch_size = int(self.config.source_batch_size)
+        groups = context.pilot_replay_groups
+        reasons = []
+        if not groups.eligible:
+            reasons.append(groups.ineligible_reason)
+        reasons.extend([context.pilot_ea_reason] if context.pilot_ea_reason else [])
+        ea = tuple(group for _, group in context.pilot_ea_candidates)
+        donors = tuple(group for _, group in context.pilot_ea_donors)
+        rl = context.pilot_rl_source
+        rl_refs = tuple(context.pilot_rl_references)
+        if not rl.eligible:
+            reasons.append(rl.ineligible_reason)
+        reasons.extend(group.ineligible_reason for group in rl_refs if not group.eligible)
+        provenance = dict(groups.provenance)
+        provenance.update({
+            "ea_candidate_actor_ids": [actor for actor, _ in context.pilot_ea_candidates],
+            "ea_candidate_roles": dict(zip(
+                ("Top", "Mid", "Low"),
+                (actor for actor, _ in context.pilot_ea_candidates),
+            )),
+            "ea_donor_actor_ids": [actor for actor, _ in context.pilot_ea_donors],
+            "ea_capture_id": ea[0].fresh_capture.capture_id if ea and ea[0].fresh_capture else None,
+            "rl_capture_id": rl.fresh_capture.capture_id if rl.fresh_capture else None,
+            "rl_own_indices": list(rl.selected_indices),
+            "rl_fresh_indices": [list(group.selected_indices) for group in rl_refs],
+            "ea_candidate_indices": [list(group.selected_indices) for group in ea],
+            "ea_donor_indices": [list(group.selected_indices) for group in donors],
+            "event_ordinals": {
+                "replay_capture": context.pilot_replay_capture_event,
+                "ea_capture": context.pilot_ea_capture_event,
+                "ea_insert": context.pilot_ea_insert_event,
+                "rl_capture": context.pilot_rl_capture_event,
+                "rl_insert": context.pilot_rl_insert_event,
+            },
+        })
+        if not reasons:
+            ea_order = CollectionOrdering(
+                run_id=context.pilot_run_id, generation=context.generation,
+                snapshot_id=groups.snapshot_id,
+                replay_capture_event=context.pilot_replay_capture_event,
+                fresh_capture_event=context.pilot_ea_capture_event,
+                replay_insert_event=context.pilot_ea_insert_event,
+                fresh_capture_id=ea[0].fresh_capture.capture_id,
+            )
+            rl_order = CollectionOrdering(
+                run_id=context.pilot_run_id, generation=context.generation,
+                snapshot_id=groups.snapshot_id,
+                replay_capture_event=context.pilot_replay_capture_event,
+                fresh_capture_event=context.pilot_rl_capture_event,
+                replay_insert_event=context.pilot_rl_insert_event,
+                fresh_capture_id=rl.fresh_capture.capture_id,
+            )
+            checks = (
+                check_disjointness(groups.controls, groups.references, batch_size=batch_size),
+                check_disjointness(ea, donors, batch_size=batch_size),
+                check_disjointness((rl,), rl_refs, batch_size=batch_size),
+                check_disjointness(ea, groups.references, batch_size=batch_size, ordering=ea_order),
+                check_disjointness((rl,), groups.references, batch_size=batch_size, ordering=rl_order),
+                check_disjointness(groups.controls, donors, batch_size=batch_size, ordering=ea_order),
+                check_disjointness(groups.controls, rl_refs, batch_size=batch_size, ordering=rl_order),
+                check_disjointness(ea, rl_refs, batch_size=batch_size),
+                check_disjointness((rl,), donors, batch_size=batch_size),
+            )
+            reasons.extend(check.ineligible_reason for check in checks if not check.eligible)
+            provenance["gate_results"] = [
+                {"eligible": check.eligible, "reason": check.ineligible_reason,
+                 "overlap_count": check.overlap_count} for check in checks
+            ]
+        learner_state = snapshot.learner_agent_state
+        frozen_before = (
+            tree_fingerprint(learner_state),
+            tree_fingerprint(snapshot.critic_opt_state),
+            tree_fingerprint(snapshot.baseline_key),
+            _replay_metadata_fingerprint(replay_after_rl),
+        )
+        results = {}
+        aggregates = {}
+        if not reasons:
+            def loss_fn(params, batch, key):
+                virtual_state = learner_state.replace(
+                    params=learner_state.params.replace(critic_params=params)
+                )
+                return td3_critic_loss(self.agent, virtual_state, batch, key)
+
+            references = {
+                "Replay": snapshot.reference_batches,
+                "RL-fresh": tuple(group.batch for group in rl_refs),
+                "EA-fresh": tuple(group.batch for group in donors),
+            }
+            reference_keys = {
+                "Replay": tuple(
+                    derive_reference_eval_key(snapshot.baseline_key, snapshot.generation, i)
+                    for i in range(4)
+                ),
+                "RL-fresh": tuple(
+                    jax.random.fold_in(
+                        derive_diagnostic_key(snapshot.baseline_key, snapshot.generation, 0x524c4556), i
+                    ) for i in range(2)
+                ),
+                "EA-fresh": tuple(
+                    jax.random.fold_in(
+                        derive_diagnostic_key(snapshot.baseline_key, snapshot.generation, 0x45414556), i
+                    ) for i in range(2)
+                ),
+            }
+            sources = (
+                tuple((source.source_id, group.batch)
+                      for source, group in zip(context.ea_sources, ea, strict=True))
+                + ((rl_source.source_id, rl.batch),)
+                + tuple((f"replay_random_{i}", group.batch)
+                        for i, group in enumerate(groups.controls))
+            )
+            for source_id, batch in sources:
+                result = evaluate_paired_utility(
+                    loss_fn=loss_fn, optimizer=self.optimizer,
+                    params=learner_state.params.critic_params,
+                    opt_state=snapshot.critic_opt_state,
+                    source_batch=batch, references=references,
+                    source_update_key=derive_source_update_key(
+                        snapshot.baseline_key, snapshot.generation
+                    ),
+                    reference_keys=reference_keys,
+                    step_scales=tuple(self.config.source_control_step_scales),
+                    tolerance=self._source_control_numerical_tolerance(self.config),
+                )
+                results[source_id] = result
+                reasons.extend(result.reasons)
+            if not reasons:
+                for family in ("Replay", "RL-fresh", "EA-fresh"):
+                    count = len(references[family])
+                    for index in range(count):
+                        values = [
+                            record.loss_ref_before
+                            for result in results.values()
+                            for record in result.records
+                            if record.reference_family == family
+                            and record.reference_index == index
+                        ]
+                        if (not values or not all(
+                                __import__("math").isfinite(value) for value in values)
+                                or max(values) - min(values)
+                                > self._source_control_numerical_tolerance(self.config)):
+                            reasons.append("common_reference_before_mismatch")
+            if not reasons:
+                for scale in self.config.source_control_step_scales:
+                    aggregates[str(scale)] = paired_aggregates(
+                        results, scale=scale, replay_source_id="replay_random_0"
+                    )
+        frozen_after = (
+            tree_fingerprint(learner_state),
+            tree_fingerprint(snapshot.critic_opt_state),
+            tree_fingerprint(snapshot.baseline_key),
+            _replay_metadata_fingerprint(replay_after_rl),
+        )
+        if frozen_before != frozen_after:
+            reasons.append("frozen_state_or_replay_mutation")
+        reasons = tuple(dict.fromkeys(reasons))
+        diagnostic = CheckpointDiagnostic.from_records(
+            checkpoint=context.generation,
+            temporal_alignment=context.source_temporal_alignment,
+            records=(), reasons=reasons,
+            measurement_eligible=not reasons,
+            comparison_eligible=not reasons,
+            eligibility_reasons=reasons,
+            source_statuses=tuple(context.ea_sources) + (rl_source,),
+        )
+        provenance["source_update_fingerprints"] = {
+            name: result.update_fingerprint for name, result in results.items()
+        }
+        self._pilot_writer.append_checkpoint(
+            generation=context.generation,
+            status="HOLD" if reasons else "PASS",
+            reasons=reasons, source_results=results,
+            aggregates=aggregates, provenance=provenance,
+        )
+        context.checkpoint_diagnostic = diagnostic
+        self._latest_source_control_diagnostic = diagnostic
+        return diagnostic
