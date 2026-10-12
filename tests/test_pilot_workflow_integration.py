@@ -187,3 +187,103 @@ def test_pilot_on_off_keep_same_real_replay_add_and_rollout():
     chex.assert_trees_all_equal(replay_rl_on, replay_rl_off)
     chex.assert_trees_all_equal(state_on.key, state_off.key)
     assert on._pilot_writer.items[0]["status"] == "PASS"
+
+def test_p1c_mechanisms_match_every_paired_record_and_keep_frozen_state():
+    from evorl.algorithms.erl.erl_td3.utility_source_controls import tree_fingerprint
+    workflow, state = setup()
+    state.ec_state = {"counter": jnp.asarray(5)}
+    baseline_fingerprints = (
+        tree_fingerprint(state.agent_state), tree_fingerprint(state.opt_state),
+        tree_fingerprint(state.key), tree_fingerprint(state.ec_state),
+    )
+    _, _, after_ea = workflow._ec_rollout(
+        state.agent_state, state.replay_buffer_state, jax.random.key(8)
+    )
+    rl_params = jax.tree_util.tree_map(lambda x: x[:1], state.agent_state.params)
+    workflow._rl_rollout(
+        state.agent_state.replace(params=rl_params), after_ea, jax.random.key(9)
+    )
+    item = workflow._pilot_writer.items[0]
+    assert item["status"] == "PASS", item["reasons"]
+    assert len(item["provenance"]["reference_gradient_fingerprints"]) == 8
+    assert len(item["provenance"]["reference_eval_key_fingerprints"]) == 8
+    assert len(item["source_results"]) == 12
+    for source_id, result in item["source_results"].items():
+        assert len(result.records) == 24
+        assert len(result.zero_step_results) == 8
+        assert len(result.mechanism_records) == 32
+        raw = {(r.reference_family,r.reference_index,r.step_scale): r.utility
+               for r in result.records + result.zero_step_results}
+        mechanisms = {(m.reference_family,m.reference_index,m.step_scale): m
+                      for m in result.mechanism_records}
+        assert set(raw) == set(mechanisms)
+        assert all(m.actual_utility == raw[key]
+                   and m.source_update_fingerprint == result.update_fingerprint
+                   for key,m in mechanisms.items())
+        assert len({m.source_gradient_fingerprint
+                    for m in result.mechanism_records}) == 1
+        for m in result.mechanism_records:
+            if m.step_scale == 0:
+                assert m.actual_parameter_displacement_norm == 0
+                assert m.first_order_predicted_utility == 0
+                assert abs(m.actual_utility) <= 1e-6
+    for family, count in (("Replay",4),("RL-fresh",2),("EA-fresh",2)):
+        for index in range(count):
+            matches = [m for result in item["source_results"].values()
+                       for m in result.mechanism_records
+                       if m.reference_family == family and m.reference_index == index]
+            assert len({m.reference_gradient_fingerprint for m in matches}) == 1
+            assert len({m.reference_eval_key_fingerprint for m in matches}) == 1
+            assert len({m.loss_ref_before for m in matches}) == 1
+    assert baseline_fingerprints == (
+        tree_fingerprint(state.agent_state), tree_fingerprint(state.opt_state),
+        tree_fingerprint(state.key), tree_fingerprint(state.ec_state),
+    )
+
+
+def test_p1c_ec_state_mutation_forces_hold_and_preserves_failed_records():
+    workflow, state = setup()
+    state.ec_state = {"counter": jnp.asarray(5)}
+    base = workflow.optimizer
+    def mutating_update(grads, opt_state, params=None):
+        state.ec_state["counter"] = state.ec_state["counter"] + 1
+        return base.update(grads, opt_state, params)
+    workflow.optimizer = optax.GradientTransformation(base.init, mutating_update)
+    _, _, after_ea = workflow._ec_rollout(
+        state.agent_state, state.replay_buffer_state, jax.random.key(8)
+    )
+    rl_params = jax.tree_util.tree_map(lambda x: x[:1], state.agent_state.params)
+    workflow._rl_rollout(
+        state.agent_state.replace(params=rl_params), after_ea, jax.random.key(9)
+    )
+    item = workflow._pilot_writer.items[0]
+    assert item["status"] == "HOLD"
+    assert "frozen_state_or_replay_mutation" in item["reasons"]
+    assert len(item["source_results"]) == 12
+
+def test_p1c_numerical_failure_keeps_source_evidence_and_holds():
+    workflow, state = setup()
+    base = workflow.optimizer
+    calls = [0]
+    def failing_update(grads, opt_state, params=None):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise FloatingPointError("synthetic invalid gradient")
+        return base.update(grads, opt_state, params)
+    workflow.optimizer = optax.GradientTransformation(base.init, failing_update)
+    _, _, after_ea = workflow._ec_rollout(
+        state.agent_state, state.replay_buffer_state, jax.random.key(8)
+    )
+    rl_params = jax.tree_util.tree_map(lambda x: x[:1], state.agent_state.params)
+    workflow._rl_rollout(
+        state.agent_state.replace(params=rl_params), after_ea, jax.random.key(9)
+    )
+    item = workflow._pilot_writer.items[0]
+    assert item["status"] == "HOLD"
+    assert "non_finite_gradient_or_utility" in item["reasons"]
+    assert len(item["failed_sources"]) == 1
+    assert item["failed_sources"][0]["source_id"] in {
+        source.source_id for source in workflow._diagnostic_context.ea_sources
+    }
+    assert item["failed_sources"][0]["source_batch_fingerprint"]
+    assert len(item["source_results"]) == 11

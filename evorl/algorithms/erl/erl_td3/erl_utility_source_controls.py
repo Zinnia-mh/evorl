@@ -41,6 +41,7 @@ from .pilot_dual_reference import (
     paired_aggregates, sample_rl_heldout,
 )
 from .pilot_artifacts import PILOT_ROOT, PilotArtifactWriter
+from .pilot_gradient_mechanisms import ReferenceGradientCache
 from .utility_source_controls import derive_reference_eval_key
 
 
@@ -324,6 +325,7 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
         context.controls_reason = None
         if getattr(self, "_pilot_enabled", False):
             context.pilot_run_id = self._pilot_run_id
+            context.pilot_state_anchor = state
             context.pilot_event_counter = 1
             context.pilot_replay_capture_event = 1
             context.pilot_snapshot = freeze_replay_snapshot(
@@ -776,14 +778,32 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                  "overlap_count": check.overlap_count} for check in checks
             ]
         learner_state = snapshot.learner_agent_state
-        frozen_before = (
-            tree_fingerprint(learner_state),
-            tree_fingerprint(snapshot.critic_opt_state),
-            tree_fingerprint(snapshot.baseline_key),
-            _replay_metadata_fingerprint(replay_after_rl),
-        )
+        def invariant_fingerprints():
+            anchor = context.pilot_state_anchor
+            counters = {
+                name: getattr(anchor.metrics, name)
+                for name in (
+                    "iterations", "sampled_episodes", "sampled_timesteps",
+                    "rl_sampled_timesteps",
+                ) if hasattr(anchor.metrics, name)
+            }
+            ec_state = getattr(anchor, "ec_state", None)
+            return (
+                tree_fingerprint(learner_state),
+                tree_fingerprint(snapshot.critic_opt_state),
+                tree_fingerprint(snapshot.baseline_key),
+                _replay_metadata_fingerprint(replay_after_rl),
+                id(replay_after_rl),
+                tree_fingerprint(anchor.agent_state),
+                tree_fingerprint(anchor.opt_state),
+                tree_fingerprint(anchor.key),
+                tree_fingerprint(counters),
+                tree_fingerprint(ec_state) if ec_state is not None else None,
+            )
+        frozen_before = invariant_fingerprints()
         results = {}
         aggregates = {}
+        failed_sources = []
         if not reasons:
             def loss_fn(params, batch, key):
                 virtual_state = learner_state.replace(
@@ -819,8 +839,15 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                 + tuple((f"replay_random_{i}", group.batch)
                         for i, group in enumerate(groups.controls))
             )
+            mechanism_cache = ReferenceGradientCache(
+                checkpoint=context.generation,
+                frozen_learner_fingerprint=frozen_before[0],
+                frozen_critic_fingerprint=snapshot.critic_fingerprint,
+                tolerance=self._source_control_numerical_tolerance(self.config),
+            )
             for source_id, batch in sources:
-                result = evaluate_paired_utility(
+                try:
+                    result = evaluate_paired_utility(
                     loss_fn=loss_fn, optimizer=self.optimizer,
                     params=learner_state.params.critic_params,
                     opt_state=snapshot.critic_opt_state,
@@ -831,9 +858,51 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                     reference_keys=reference_keys,
                     step_scales=tuple(self.config.source_control_step_scales),
                     tolerance=self._source_control_numerical_tolerance(self.config),
-                )
+                    mechanism_cache=mechanism_cache,
+                    )
+                except FloatingPointError:
+                    reasons.append("non_finite_gradient_or_utility")
+                    failed_sources.append({
+                        "source_id": source_id,
+                        "reason": "non_finite_gradient_or_utility",
+                        "source_batch_fingerprint": tree_fingerprint(batch),
+                    })
+                    continue
+                except ValueError as error:
+                    if "reference_cache_mismatch" not in str(error):
+                        raise
+                    reasons.append("reference_cache_mismatch")
+                    failed_sources.append({
+                        "source_id": source_id,
+                        "reason": "reference_cache_mismatch",
+                        "source_batch_fingerprint": tree_fingerprint(batch),
+                    })
+                    continue
                 results[source_id] = result
                 reasons.extend(result.reasons)
+                if len(result.mechanism_records) != (
+                        len(result.records) + len(result.zero_step_results)):
+                    reasons.append("mechanism_utility_key_mismatch")
+                for record in result.mechanism_records:
+                    if record.step_scale == 0.0 and (
+                            record.actual_parameter_displacement_norm != 0.0
+                            or record.first_order_predicted_utility != 0.0
+                            or abs(record.actual_utility)
+                            > self._source_control_numerical_tolerance(self.config)):
+                        reasons.append("mechanism_zero_step_failure")
+            provenance["mechanism_failed_sources"] = failed_sources
+            provenance["reference_gradient_fingerprints"] = {
+                f"{family}/{index}": entry.gradient_fingerprint
+                for (family, index), entry in mechanism_cache.entries.items()
+            }
+            provenance["reference_eval_key_fingerprints"] = {
+                f"{family}/{index}": entry.reference_eval_key_fingerprint
+                for (family, index), entry in mechanism_cache.entries.items()
+            }
+            provenance["source_gradient_fingerprints"] = {
+                name: result.mechanism_records[0].source_gradient_fingerprint
+                for name, result in results.items() if result.mechanism_records
+            }
             if not reasons:
                 for family in ("Replay", "RL-fresh", "EA-fresh"):
                     count = len(references[family])
@@ -855,12 +924,7 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                     aggregates[str(scale)] = paired_aggregates(
                         results, scale=scale, replay_source_id="replay_random_0"
                     )
-        frozen_after = (
-            tree_fingerprint(learner_state),
-            tree_fingerprint(snapshot.critic_opt_state),
-            tree_fingerprint(snapshot.baseline_key),
-            _replay_metadata_fingerprint(replay_after_rl),
-        )
+        frozen_after = invariant_fingerprints()
         if frozen_before != frozen_after:
             reasons.append("frozen_state_or_replay_mutation")
         reasons = tuple(dict.fromkeys(reasons))
@@ -881,6 +945,15 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             status="HOLD" if reasons else "PASS",
             reasons=reasons, source_results=results,
             aggregates=aggregates, provenance=provenance,
+            seed=getattr(self.config, "seed", None),
+            source_types={
+                **{source.source_id: source.source_type for source in context.ea_sources},
+                rl_source.source_id: rl_source.source_type,
+                **{f"replay_random_{i}": "Replay-random"
+                   for i in range(len(groups.controls))},
+            },
+            frozen_critic_fingerprint=snapshot.critic_fingerprint,
+            require_mechanisms=True, failed_sources=failed_sources,
         )
         context.checkpoint_diagnostic = diagnostic
         self._latest_source_control_diagnostic = diagnostic

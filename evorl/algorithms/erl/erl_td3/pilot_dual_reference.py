@@ -16,6 +16,7 @@ from .pilot_transition_identity import (
     sample_fresh_source,
 )
 from .utility_source_controls import tree_fingerprint
+from .pilot_gradient_mechanisms import measure_mechanisms
 
 
 @dataclass(frozen=True)
@@ -35,13 +36,16 @@ class PairedResult:
     update_fingerprint: str
     valid: bool
     reasons: tuple[str, ...]
+    mechanism_records: tuple = ()
 
 
 def evaluate_paired_utility(
     *, loss_fn, optimizer, params, opt_state, source_batch, references,
     source_update_key, reference_keys, step_scales, tolerance,
+    mechanism_cache=None,
 ):
     """One exact source gradient and Optax update, shared by all families."""
+    step_scales = tuple(step_scales)
     if tolerance <= 0 or any(scale <= 0 for scale in step_scales):
         raise ValueError("positive tolerance and scales required")
     families = ("Replay", "RL-fresh", "EA-fresh")
@@ -75,7 +79,20 @@ def evaluate_paired_utility(
             before_values = [r.loss_ref_before for r in records if r.reference_family == family and r.reference_index == index]
             if max(before_values) - min(before_values) > tolerance:
                 reasons.append("common_reference_before_mismatch")
-    return PairedResult(tuple(records), tuple(zero), fingerprint, not reasons, tuple(dict.fromkeys(reasons)))
+    mechanisms = ()
+    if mechanism_cache is not None:
+        mechanisms, mechanism_reasons = measure_mechanisms(
+            loss_fn=loss_fn, params=params, source_gradient=grad,
+            optax_update=updates, virtual_params_by_scale=virtual,
+            utility_records=tuple(records) + tuple(zero),
+            reference_batches=references, reference_keys=reference_keys,
+            cache=mechanism_cache, update_fingerprint=fingerprint,
+        )
+        reasons.extend(mechanism_reasons)
+    return PairedResult(
+        tuple(records), tuple(zero), fingerprint, not reasons,
+        tuple(dict.fromkeys(reasons)), mechanisms,
+    )
 
 
 def _fresh_batch_at(raw, *, run_id, generation, producer, positions, valid_count):
