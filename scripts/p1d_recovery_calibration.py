@@ -15,6 +15,7 @@ from typing import Any
 import jax
 import jax.tree_util as jtu
 import numpy as np
+import jax.numpy as jnp
 
 REQUIRED_STATE = (
     "agent_state", "opt_state", "ec_opt_state", "key",
@@ -108,6 +109,91 @@ def training_state_fingerprints(state: Any) -> dict[str, str]:
         else:
             result[field] = _hash_tree(getattr(state, field))
     return result
+
+
+def state_leaf_differences(left: Any, right: Any) -> list[dict]:
+    """Scalar device reductions only; Replay payload is limited to occupied slots."""
+    differences = []
+    def compare_tree(field: str, a: Any, b: Any, occupied: int | None = None):
+        la, sa = jtu.tree_flatten_with_path(a)
+        lb, sb = jtu.tree_flatten_with_path(b)
+        if sa != sb or len(la) != len(lb):
+            differences.append({"path": field, "reason": "tree_structure_mismatch"})
+            return
+        for (path, av), (_, bv) in zip(la, lb):
+            cursor = a
+            parts = [field]
+            for key in path:
+                if isinstance(cursor, dict) and hasattr(key, "key") and isinstance(key.key, int):
+                    name = sorted(cursor)[key.key]
+                elif hasattr(key, "idx"):
+                    name = sorted(cursor)[key.idx] if isinstance(cursor, dict) else key.idx
+                elif hasattr(key, "key"):
+                    name = key.key
+                elif hasattr(key, "name"):
+                    name = key.name
+                else:
+                    name = str(key)
+                parts.append(str(name))
+                cursor = cursor[name] if isinstance(cursor, dict) else (
+                    cursor[name] if isinstance(name, int) else getattr(cursor, name)
+                )
+            label = ".".join(parts)
+            aa, bb = jnp.asarray(av), jnp.asarray(bv)
+            if occupied is not None:
+                aa, bb = aa[:occupied], bb[:occupied]
+            entry = {"path": label, "shape": list(aa.shape),
+                     "dtype": str(aa.dtype), "exact_equal": False}
+            if aa.shape != bb.shape or aa.dtype != bb.dtype:
+                entry["reason"] = "shape_or_dtype_mismatch"
+                entry["other_shape"] = list(bb.shape)
+                entry["other_dtype"] = str(bb.dtype)
+                differences.append(entry)
+                continue
+            equal = jnp.equal(aa, bb)
+            count = int(jax.device_get(jnp.count_nonzero(jnp.logical_not(equal))))
+            if count == 0:
+                continue
+            entry["different_elements"] = count
+            if aa.dtype.kind in "fc" and bb.dtype.kind in "fc":
+                entry["all_finite"] = bool(jax.device_get(
+                    jnp.all(jnp.isfinite(aa)) & jnp.all(jnp.isfinite(bb))))
+                entry["max_absolute_difference"] = float(jax.device_get(
+                    jnp.max(jnp.abs(aa - bb), initial=0)))
+            else:
+                entry["all_finite"] = True
+                entry["max_absolute_difference"] = None
+            differences.append(entry)
+    for field in REQUIRED_STATE:
+        if field != "replay_buffer_state":
+            compare_tree(field, getattr(left, field), getattr(right, field))
+            continue
+        a, b = left.replay_buffer_state, right.replay_buffer_state
+        compare_tree(field + ".buffer_size", a.buffer_size, b.buffer_size)
+        compare_tree(field + ".current_index", a.current_index, b.current_index)
+        size_a, size_b = int(_host_array(a.buffer_size)), int(_host_array(b.buffer_size))
+        if size_a != size_b:
+            differences.append({"path": field + ".data",
+                                "reason": "occupied_size_mismatch",
+                                "left_size": size_a, "right_size": size_b})
+        else:
+            compare_tree(field + ".data", a.data, b.data, occupied=size_a)
+    return differences
+
+
+def first_divergent_stage(off: dict, on: dict) -> str | None:
+    """Order follows ERLOriginWorkflow.step, including add inside rollouts."""
+    order = (
+        "ea_rollout_input", "ea_replay_add", "ea_rollout_output", "ea_rollout",
+        "rl_rollout_input", "rl_replay_add", "rl_rollout_output", "rl_rollout",
+        "rl_learner_update_input", "rl_learner_update",
+        "ea_evolution_update_input", "ea_evolution_update",
+    )
+    for name in order:
+        if name in off or name in on:
+            if off.get(name) != on.get(name):
+                return name
+    return None
 
 
 def compare_training_states(a: Any, b: Any, *,
@@ -213,11 +299,13 @@ def run_pair(off: Any, on: Any, pre: Any, *,
     if int(_host_array(pre.metrics.iterations)) != 10:
         raise RecoveryHold("wrong_pre_step_generation")
     same_pre = compare_training_states(pre, pre if on_pre is None else on_pre)
+    audit = {"pre_state_fingerprints": same_pre}
     if on_pre is not None and on_pre is not pre:
         raise RecoveryHold("common_pre_step_object_mismatch")
     original = training_state_fingerprints(pre)
     off_post, off_counts, off_time = _step(off, pre)
     off_post_hashes = training_state_fingerprints(off_post)
+    audit["off_post_fingerprints"] = off_post_hashes
     off_environment = _environment_counts(pre, off_post)
     if training_state_fingerprints(pre) != original:
         raise RecoveryHold("pre_step_state_mutation", "OFF")
@@ -229,40 +317,58 @@ def run_pair(off: Any, on: Any, pre: Any, *,
         del repeat_post
         if training_state_fingerprints(pre) != original:
             raise RecoveryHold("pre_step_state_mutation", "OFF repeat")
+    # A new PyTree container keeps device leaves for leaf-level attribution,
+    # while releasing the OFF State object before invoking ON.
+    off_snapshot = jtu.tree_map(lambda leaf: leaf, off_post)
     del off_post
     import gc
     gc.collect()
     compare_training_states(pre, pre if on_pre is None else on_pre)
     on_post, on_counts, on_time = _step(on, pre if on_pre is None else on_pre)
     on_environment = _environment_counts(pre, on_post)
+    audit["on_post_fingerprints"] = training_state_fingerprints(on_post)
+    audit["call_counts"] = {"off": off_counts, "on": on_counts}
+    audit["environment_counts"] = {"off": off_environment, "on": on_environment}
+    audit["step_seconds"] = {"off": off_time, "on": on_time}
+    audit["available_stage_fingerprints"] = {
+        "off": getattr(off, "_recovery_stage_fingerprints", {}),
+        "on": getattr(on, "_recovery_stage_fingerprints", {}),
+    }
+    audit["first_divergent_stage"] = first_divergent_stage(
+        audit["available_stage_fingerprints"]["off"],
+        audit["available_stage_fingerprints"]["on"],
+    )
     if training_state_fingerprints(pre) != original:
-        raise RecoveryHold("pre_step_state_mutation", "ON")
+        raise RecoveryHold("pre_step_state_mutation", "ON", {"audit": audit})
     for name in ("collectors", "ec_collectors", "rl_collectors", "replay_adds"):
         if name not in off_counts and name not in on_counts:
             if name in ("ec_collectors", "rl_collectors"):
                 continue  # synthetic minimal workflow; real arms report both
-            raise RecoveryHold("missing_call_counts", name)
+            raise RecoveryHold("missing_call_counts", name, {"audit": audit})
         if name not in off_counts or name not in on_counts:
-            raise RecoveryHold("missing_call_counts", name)
+            raise RecoveryHold("missing_call_counts", name, {"audit": audit})
         if off_counts[name] < 0 or on_counts[name] < 0:
-            raise RecoveryHold("missing_call_counts", name)
+            raise RecoveryHold("missing_call_counts", name, {"audit": audit})
         if off_counts[name] != on_counts[name]:
             raise RecoveryHold(
                 "replay_add_call_mismatch" if name == "replay_adds"
-                else "collector_call_mismatch", name
+                else "collector_call_mismatch", name, {"audit": audit}
             )
     if off_environment != on_environment:
         raise RecoveryHold("environment_step_mismatch", details={
-            "off": off_environment, "on": on_environment,
+            "off": off_environment, "on": on_environment, "audit": audit,
         })
-    post_hashes = training_state_fingerprints(on_post)
-    for field in REQUIRED_STATE:
-        if off_post_hashes[field] != post_hashes[field]:
-            raise RecoveryHold(
-                "on_off_baseline_mismatch", field,
-                {"off": off_post_hashes, "on": post_hashes},
-            )
-    del on_post
+    post_hashes = audit["on_post_fingerprints"]
+    mismatched = [field for field in REQUIRED_STATE
+                  if off_post_hashes[field] != post_hashes[field]]
+    if mismatched:
+        audit["all_mismatched_fields"] = mismatched
+        audit["first_mismatched_field"] = mismatched[0]
+        audit["leaf_differences"] = state_leaf_differences(off_snapshot, on_post)
+        raise RecoveryHold("on_off_baseline_mismatch", mismatched[0],
+                           {"off": off_post_hashes, "on": post_hashes,
+                            "audit": audit})
+    del off_snapshot, on_post
     return {
         "status": "PASS", "generation": 11,
         "common_pre_step_state": True,
@@ -293,6 +399,97 @@ def _instrument_rollouts(workflow: Any) -> None:
             return result
         setattr(workflow, method, wrapped)
     workflow._recovery_counts = counts
+
+
+def instrument_baseline_stages(workflow: Any):
+    """Observe eager boundaries of the existing step without extra execution.
+
+    The actual ERLOriginWorkflow.step order is EA rollout/add, RL
+    rollout/add, RL learner update, then EA evolution update. No Python
+    callback is inserted inside a traced collector or compiled JAX kernel.
+    """
+    records: dict[str, dict] = {}
+    workflow._recovery_stage_fingerprints = records
+    replay = workflow.replay_buffer
+    original_add = replay.add
+    add_calls = 0
+
+    def observed_add(buffer_state, xs, mask=None):
+        nonlocal add_calls
+        add_calls += 1
+        name = ("ea_replay_add" if add_calls == 1 else
+                "rl_replay_add" if add_calls == 2 else
+                f"unexpected_replay_add_{add_calls}")
+        count = (int(_host_array(mask.sum())) if mask is not None else
+                 int(jtu.tree_leaves(xs)[0].shape[0]))
+        record = {
+            "replay_before": occupied_replay_fingerprint(buffer_state),
+            "add_input": _hash_tree(xs),
+            "mask": _hash_tree(mask) if mask is not None else None,
+            "valid_transition_count": count,
+        }
+        result = original_add(buffer_state, xs, mask)
+        record["replay_after"] = occupied_replay_fingerprint(result)
+        records[name] = record
+        return result
+    # ReplayBuffer is a frozen PyTreeNode. Shadow only this instance's method
+    # for the one audited step, then remove the shadow in the caller's finally.
+    object.__setattr__(replay, "add", observed_add)
+
+    for method, family in (("_ec_rollout", "ea"),
+                           ("_rl_rollout", "rl")):
+        if not hasattr(workflow, method):
+            continue
+        original = getattr(workflow, method)
+        def observed_rollout(agent_state, replay_state, key,
+                             _original=original, _family=family):
+            records[_family + "_rollout_input"] = {
+                "agent": _hash_tree(agent_state),
+                "key": _hash_tree(key),
+                "replay": occupied_replay_fingerprint(replay_state),
+            }
+            metrics, trajectory, result_replay = _original(
+                agent_state, replay_state, key
+            )
+            records[_family + "_rollout_output"] = {
+                "metrics": _hash_tree(metrics),
+                "transition_batch": _hash_tree(trajectory),
+                "replay": occupied_replay_fingerprint(result_replay),
+            }
+            return metrics, trajectory, result_replay
+        setattr(workflow, method, observed_rollout)
+
+    for method, label in (
+        ("_rl_update", "rl_learner_update"),
+        ("_ec_update", "ea_evolution_update"),
+        ("_ec_update_with_rl_injection", "ea_evolution_update"),
+    ):
+        if not hasattr(workflow, method):
+            continue
+        original = getattr(workflow, method)
+        def observed_update(*args, _original=original, _label=label, **kwargs):
+            if _label == "rl_learner_update":
+                records[_label + "_input"] = {
+                    "agent": _hash_tree(args[0]),
+                    "optimizer": _hash_tree(args[1]),
+                    "replay": occupied_replay_fingerprint(args[2]),
+                    "key": _hash_tree(args[3]),
+                    "num_updates": int(_host_array(args[4])) if len(args) > 4 else None,
+                }
+            else:
+                records[_label + "_input"] = {
+                    "ec_optimizer": _hash_tree(args[0]),
+                    "fitnesses": _hash_tree(args[-1]),
+                    "learner_agent": _hash_tree(args[1]) if len(args) > 2 else None,
+                }
+            result = _original(*args, **kwargs)
+            records[_label] = {"output": _hash_tree(result)}
+            return result
+        setattr(workflow, method, observed_update)
+
+    def restore():
+        object.__delattr__(replay, "add")
+    return restore
 
 
 def read_pilot_summary(pilot_run_dir: Path) -> dict:
@@ -411,6 +608,7 @@ def _real_entry(run_dir: Path, overrides: list[str]) -> dict:
     workflow_cls = type("P1DRecoveryWorkflow", (ERLUtilitySourceControlsWorkflow,), {})
     off = workflow_cls.build_from_config(off_config, enable_jit=True)
     on = None
+    restore_off = restore_on = None
     try:
         # Workflow.init runs the sole real ten-iteration warmup prefix.
         pre, prefix_seconds = capture_pre_step(off, jax.random.PRNGKey(42))
@@ -424,6 +622,8 @@ def _real_entry(run_dir: Path, overrides: list[str]) -> dict:
         internal = audit_workflow_contexts(off, on)
         _instrument_rollouts(off)
         _instrument_rollouts(on)
+        restore_off = instrument_baseline_stages(off)
+        restore_on = instrument_baseline_stages(on)
         original_on_step = on.step
         def observed_on_step(state):
             with observe_pilot_stages() as observed:
@@ -432,7 +632,34 @@ def _real_entry(run_dir: Path, overrides: list[str]) -> dict:
                 finally:
                     on._recovery_pilot_stages = observed
         on.step = observed_on_step
-        audit = run_pair(off, on, pre)
+        try:
+            audit = run_pair(off, on, pre)
+        except RecoveryHold as error:
+            partial = error.details.setdefault("audit", {})
+            partial.setdefault("pre_state_fingerprints", captured_pre)
+            partial.setdefault("available_stage_fingerprints", {
+                "off": getattr(off, "_recovery_stage_fingerprints", {}),
+                "on": getattr(on, "_recovery_stage_fingerprints", {}),
+            })
+            partial.setdefault("call_counts", {
+                "off": _counts(off), "on": _counts(on),
+            })
+            partial.setdefault("replay_add_count_basis",
+                               "inferred one add per inspected EC/RL host rollout boundary")
+            partial["prefix_seconds"] = prefix_seconds
+            partial["pilot_stage_timings"] = getattr(
+                on, "_recovery_pilot_stages", None
+            )
+            partial["workflow_internal_state_audit"] = internal
+            partial["pilot_artifact_directory"] = str(on._pilot_writer.root)
+            try:
+                partial["pilot_status"] = read_pilot_summary(
+                    on._pilot_writer.root
+                )["status"]
+            except RecoveryHold as pilot_error:
+                partial["pilot_status"] = "HOLD"
+                partial["pilot_hold_reason"] = pilot_error.reason
+            raise
         audit["prefix_seconds"] = prefix_seconds
         audit["pilot_stage_timings"] = on._recovery_pilot_stages
         audit["workflow_internal_state_audit"] = internal
@@ -447,6 +674,10 @@ def _real_entry(run_dir: Path, overrides: list[str]) -> dict:
             audit["field"] = error.field
         return audit
     finally:
+        if restore_off is not None:
+            restore_off()
+        if restore_on is not None:
+            restore_on()
         off.close()
         if on is not None:
             on.close()
@@ -467,6 +698,9 @@ def main(argv: list[str] | None = None) -> int:
     except RecoveryHold as error:
         result = {"status": "HOLD", "reason": error.reason,
                   "field": error.field, "details": error.details}
+        result.update(error.details.get("audit", {}))
+        if not run_dir.exists():
+            run_dir.mkdir(parents=True, exist_ok=False)
     except Exception as error:
         import traceback
         result = {"status": "HOLD", "reason": "unexpected_exception",

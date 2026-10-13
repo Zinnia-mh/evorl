@@ -304,3 +304,173 @@ def test_stage_timer_restores_observed_function(monkeypatch):
     assert module.sample_fresh_source is original
     assert observed["counts"]["rl_own_construction"] == 1
     assert observed["seconds"]["rl_own_construction"] >= 0
+
+
+def test_hold_retains_all_post_mismatches_and_pre_evidence():
+    class Divergent(FakeWorkflow):
+        def step(self, state):
+            _, out = super().step(state)
+            out = changed(out, "critic", 99.0)
+            out = changed(out, "optimizer", 88.0)
+            return None, changed(out, "replay", 77)
+    with pytest.raises(RecoveryHold) as caught:
+        run_pair(FakeWorkflow(), Divergent(True), make_state())
+    audit = caught.value.details["audit"]
+    assert audit["pre_state_fingerprints"]
+    assert audit["all_mismatched_fields"] == [
+        "agent_state", "opt_state", "replay_buffer_state"
+    ]
+    assert audit["first_mismatched_field"] == "agent_state"
+    assert audit["call_counts"]["off"]["replay_adds"] == 2
+    assert audit["call_counts"]["on"]["replay_adds"] == 2
+    paths = [x["path"] for x in audit["leaf_differences"]]
+    assert any("critic_params" in x for x in paths)
+    assert any("replay_buffer_state.data" in x for x in paths)
+
+
+def test_occupied_replay_leaf_evidence_ignores_uninitialized_tail():
+    from scripts.p1d_recovery_calibration import state_leaf_differences
+    a, b = make_state(tail=0), make_state(tail=999)
+    assert state_leaf_differences(a, b) == []
+    differences = state_leaf_differences(a, changed(b, "replay", 77))
+    assert len(differences) == 1
+    assert differences[0]["different_elements"] == 1
+    assert differences[0]["shape"] == [2]
+
+
+def test_first_divergence_uses_real_step_order():
+    from scripts.p1d_recovery_calibration import first_divergent_stage
+    off = {"ea_rollout": {"replay": "a"}, "rl_rollout": {"replay": "x"},
+           "rl_learner_update": {"agent": "one"}}
+    on = {"ea_rollout": {"replay": "a"}, "rl_rollout": {"replay": "y"},
+          "rl_learner_update": {"agent": "two"}}
+    assert first_divergent_stage(off, on) == "rl_rollout"
+    on["rl_rollout"] = off["rl_rollout"]
+    assert first_divergent_stage(off, on) == "rl_learner_update"
+
+
+def test_hold_file_preserves_partial_audit(tmp_path, monkeypatch):
+    import scripts.p1d_recovery_calibration as harness
+    monkeypatch.setattr(harness, "OUTPUT_PARENT", tmp_path)
+    def fail(*args):
+        raise RecoveryHold("on_off_baseline_mismatch", "agent_state",
+                           {"audit": {"pre_state_fingerprints": {"key": "abc"},
+                                      "all_mismatched_fields": ["agent_state"]}})
+    monkeypatch.setattr(harness, "_real_entry", fail)
+    run = tmp_path / "new"
+    assert harness.main(["--run-dir", str(run)]) == 2
+    row = __import__("json").loads((run / "state_audit.json").read_text())
+    assert row["pre_state_fingerprints"]["key"] == "abc"
+    assert row["all_mismatched_fields"] == ["agent_state"]
+
+
+def test_class_level_jit_wrapping_is_visible_to_both_arms(monkeypatch):
+    from evorl.algorithms.erl.erl_td3.erl_learner_utility import ERLLearnerUtilityWorkflow as Parent
+    from evorl.algorithms.erl.erl_td3.erl_utility_source_controls import ERLUtilitySourceControlsWorkflow as Child
+    names = ("_rl_rollout", "_ec_update", "_ec_update_with_rl_injection",
+             "evaluate", "_postsetup_replaybuffer")
+    originals = {name: Parent.__dict__.get(name) for name in names}
+    dynamic = type("R4DynamicWorkflow", (Child,), {})
+    try:
+        dynamic.enable_jit()
+        assert Parent.__dict__["_ec_update"] is not originals["_ec_update"]
+        assert dynamic._ec_update is Parent._ec_update
+        # A later enable_jit=False build does not undo class-level wrapping.
+        assert dynamic._ec_update is Parent._ec_update
+    finally:
+        for name, old in originals.items():
+            if old is None:
+                delattr(Parent, name)
+            else:
+                setattr(Parent, name, old)
+
+
+def test_host_stage_probes_observe_without_extra_rollout_or_add():
+    from scripts.p1d_recovery_calibration import instrument_baseline_stages
+    class Replay:
+        calls = 0
+        def add(self, rb, xs, mask=None):
+            self.calls += 1
+            return rb
+    class Workflow:
+        def __init__(self):
+            self.replay_buffer = Replay()
+            self.rollouts = 0
+        def _ec_rollout(self, agent, replay, key):
+            self.rollouts += 1
+            after = self.replay_buffer.add(replay, jnp.array([1, 2]))
+            return jnp.array(1), jnp.array([1, 2]), after
+    workflow = Workflow()
+    instrument_baseline_stages(workflow)
+    state = make_state()
+    workflow._ec_rollout(state.agent_state, state.replay_buffer_state, state.key)
+    assert workflow.rollouts == 1
+    assert workflow.replay_buffer.calls == 1
+    evidence = workflow._recovery_stage_fingerprints
+    assert "ea_rollout_input" in evidence
+    assert "ea_replay_add" in evidence
+    assert "ea_rollout_output" in evidence
+    assert evidence["ea_replay_add"]["valid_transition_count"] == 2
+
+
+@pytest.mark.parametrize("stage", [
+    "ea_rollout_input", "ea_replay_add", "rl_learner_update",
+])
+def test_stage_comparator_localizes_synthetic_first_difference(stage):
+    from scripts.p1d_recovery_calibration import first_divergent_stage
+    order = ("ea_rollout_input", "ea_replay_add", "ea_rollout_output",
+             "rl_rollout_input", "rl_replay_add", "rl_rollout_output",
+             "rl_learner_update", "ea_evolution_update")
+    off = {name: {"fingerprint": "same"} for name in order}
+    on = {name: dict(value) for name, value in off.items()}
+    on[stage]["fingerprint"] = "changed"
+    on["ea_evolution_update"]["fingerprint"] = "also_changed"
+    assert first_divergent_stage(off, on) == stage
+
+
+def test_disabled_diagnostics_do_not_change_synthetic_baseline():
+    off, on = FakeWorkflow(enabled=False), FakeWorkflow(enabled=False)
+    pre = make_state()
+    audit = run_pair(off, on, pre)
+    assert audit["baseline_post_step_equal"]
+    assert (off.calls, on.calls) == (1, 1)
+    assert int(pre.metrics.iterations) == 10
+
+
+def test_leaf_numeric_delta_reports_same_dtype_float_difference():
+    from scripts.p1d_recovery_calibration import state_leaf_differences
+    pre = make_state()
+    altered = changed(pre, "critic", jnp.float32(9))
+    row = next(x for x in state_leaf_differences(pre, altered)
+               if "critic_params" in x["path"])
+    assert row["different_elements"] == 1
+    assert row["all_finite"]
+    assert row["max_absolute_difference"] == 7.0
+
+
+def test_stage_probe_supports_frozen_real_replay_buffer_and_restores():
+    from scripts.p1d_recovery_calibration import instrument_baseline_stages
+    real = ReplayBuffer(capacity=5, sample_batch_size=1)
+    workflow = SimpleNamespace(replay_buffer=real)
+    restore = instrument_baseline_stages(workflow)
+    assert "add" in real.__dict__
+    before = real.init(jnp.array(0, dtype=jnp.int32))
+    after = real.add(before, jnp.array([4, 5], dtype=jnp.int32))
+    assert int(after.buffer_size) == 2
+    assert workflow._recovery_stage_fingerprints["ea_replay_add"]["valid_transition_count"] == 2
+    restore()
+    assert "add" not in real.__dict__
+
+
+def test_call_count_hold_preserves_already_computed_post_hashes():
+    class ExtraAdd(FakeWorkflow):
+        def step(self, state):
+            result = super().step(state)
+            self.replay_adds += 1
+            return result
+    with pytest.raises(RecoveryHold, match="replay_add_call_mismatch") as caught:
+        run_pair(FakeWorkflow(), ExtraAdd(True), make_state())
+    audit = caught.value.details["audit"]
+    assert audit["pre_state_fingerprints"]
+    assert audit["off_post_fingerprints"]
+    assert audit["on_post_fingerprints"]
