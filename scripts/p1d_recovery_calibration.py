@@ -870,6 +870,8 @@ def main(argv: list[str] | None = None) -> int:
         result = {"status": "HOLD", "reason": "unexpected_exception",
                   "error": repr(error), "traceback": traceback.format_exc()}
     finally:
+        if result is not None and not run_dir.exists():
+            run_dir.mkdir(parents=True, exist_ok=False)
         if run_dir.exists() and result is not None:
             (run_dir / "state_audit.json").write_text(
                 json.dumps(result, indent=2, sort_keys=True)

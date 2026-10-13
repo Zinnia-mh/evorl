@@ -533,3 +533,18 @@ def test_stage_replay_comparison_excludes_unoccupied_tail():
     assert stage_numeric_differences({"ea_replay_add": {"replay_after": a}},
                                      {"ea_replay_add": {"replay_after": b}},
                                      "ea_replay_add") == []
+
+
+def test_early_unexpected_failure_writes_hold_audit(monkeypatch, tmp_path):
+    import json
+    from scripts import p1d_recovery_calibration as harness
+    monkeypatch.setattr(harness, "OUTPUT_PARENT", tmp_path)
+    def fail(*args):
+        raise RuntimeError("early probe failure")
+    monkeypatch.setattr(harness, "_real_entry", fail)
+    run_dir = tmp_path / "unique"
+    assert harness.main(["--run-dir", str(run_dir)]) == 2
+    audit = json.loads((run_dir / "state_audit.json").read_text())
+    assert audit["status"] == "HOLD"
+    assert audit["reason"] == "unexpected_exception"
+    assert "early probe failure" in audit["traceback"]
