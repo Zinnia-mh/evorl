@@ -279,3 +279,28 @@ def test_environment_step_count_parity_is_explicit():
                 sampled_timesteps=post.metrics.sampled_timesteps + 1))
     with pytest.raises(RecoveryHold, match="environment_step_mismatch"):
         run_pair(FakeWorkflow(), ExtraEnvironmentStep(True), make_state())
+
+def test_capture_prefix_runs_init_once_and_requires_generation_11_input():
+    from scripts.p1d_recovery_calibration import capture_pre_step
+    class Init:
+        calls = 0
+        def init(self, key):
+            self.calls += 1
+            return make_state()
+    workflow = Init()
+    state, seconds = capture_pre_step(workflow, jax.random.PRNGKey(42))
+    assert workflow.calls == 1
+    assert int(state.metrics.iterations) == 10
+    assert seconds >= 0
+
+
+def test_stage_timer_restores_observed_function(monkeypatch):
+    from evorl.algorithms.erl.erl_td3 import erl_utility_source_controls as module
+    from scripts.p1d_recovery_calibration import observe_pilot_stages
+    original = lambda: 73
+    monkeypatch.setattr(module, "sample_fresh_source", original)
+    with observe_pilot_stages() as observed:
+        assert module.sample_fresh_source() == 73
+    assert module.sample_fresh_source is original
+    assert observed["counts"]["rl_own_construction"] == 1
+    assert observed["seconds"]["rl_own_construction"] >= 0

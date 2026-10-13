@@ -5,6 +5,7 @@ This module is inert on import. A real run is an R2 action, not an R1 test.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -310,6 +311,69 @@ def read_pilot_summary(pilot_run_dir: Path) -> dict:
     return row
 
 
+def capture_pre_step(workflow: Any, key: Any) -> tuple[Any, float]:
+    """Run the sole normal warmup prefix and synchronize before timing."""
+    start = time.perf_counter()
+    pre = workflow.init(key)
+    for leaf in jtu.tree_leaves(pre):
+        ready = getattr(leaf, "block_until_ready", None)
+        if ready is not None:
+            ready()
+    elapsed = time.perf_counter() - start
+    if int(_host_array(pre.metrics.iterations)) != 10:
+        raise RecoveryHold("wrong_pre_step_generation")
+    return pre, elapsed
+
+
+@contextmanager
+def observe_pilot_stages():
+    """Time eager diagnostic boundaries, restoring every callable afterwards.
+
+    Durations are host-wall and overlapping/non-additive; first JIT compilation
+    and asynchronous device work can contaminate them.
+    """
+    from evorl.algorithms.erl.erl_td3 import erl_utility_source_controls as workflow_mod
+    from evorl.algorithms.erl.erl_td3 import pilot_dual_reference as dual_mod
+    from evorl.algorithms.erl.erl_td3 import pilot_gradient_mechanisms as grad_mod
+    from evorl.algorithms.erl.erl_td3 import pilot_artifacts as artifact_mod
+
+    targets = (
+        (workflow_mod, "sample_disjoint_replay_groups", "replay_sampling"),
+        (workflow_mod, "choose_ea_candidates_and_donors", "ea_fresh_construction"),
+        (workflow_mod, "sample_fresh_source", "rl_own_construction"),
+        (workflow_mod, "sample_rl_heldout", "rl_fresh_construction"),
+        (workflow_mod, "check_disjointness", "identity_validation"),
+        (workflow_mod, "evaluate_paired_utility", "source_update_and_reference_eval"),
+        (workflow_mod.ERLUtilitySourceControlsWorkflow,
+         "_run_deferred_pilot_diagnostic", "pilot_diagnostic"),
+        (grad_mod.ReferenceGradientCache, "get", "reference_gradient_cache"),
+        (dual_mod, "measure_mechanisms", "mechanism_measurement"),
+        (artifact_mod.PilotArtifactWriter, "append_checkpoint", "artifact_writing"),
+    )
+    observed = {"seconds": {}, "counts": {},
+                "basis": "eager host-wall; nested, asynchronous and compilation-contaminated"}
+    originals = []
+    try:
+        for target, name, label in targets:
+            original = getattr(target, name)
+            originals.append((target, name, original))
+            def timed(*args, _original=original, _label=label, **kwargs):
+                start = time.perf_counter()
+                try:
+                    return _original(*args, **kwargs)
+                finally:
+                    observed["seconds"][_label] = (
+                        observed["seconds"].get(_label, 0.0)
+                        + time.perf_counter() - start
+                    )
+                    observed["counts"][_label] = observed["counts"].get(_label, 0) + 1
+            setattr(target, name, timed)
+        yield observed
+    finally:
+        for target, name, original in reversed(originals):
+            setattr(target, name, original)
+
+
 def _real_entry(run_dir: Path, overrides: list[str]) -> dict:
     """The R2-only CLI. Importing/testing this module does not invoke it."""
     import copy
@@ -349,9 +413,7 @@ def _real_entry(run_dir: Path, overrides: list[str]) -> dict:
     on = None
     try:
         # Workflow.init runs the sole real ten-iteration warmup prefix.
-        pre = off.init(jax.random.PRNGKey(42))
-        if int(_host_array(pre.metrics.iterations)) != 10:
-            raise RecoveryHold("wrong_pre_step_generation")
+        pre, prefix_seconds = capture_pre_step(off, jax.random.PRNGKey(42))
         captured_pre = training_state_fingerprints(pre)
         on = workflow_cls.build_from_config(on_config, enable_jit=False)
         if training_state_fingerprints(pre) != captured_pre:
@@ -362,7 +424,17 @@ def _real_entry(run_dir: Path, overrides: list[str]) -> dict:
         internal = audit_workflow_contexts(off, on)
         _instrument_rollouts(off)
         _instrument_rollouts(on)
+        original_on_step = on.step
+        def observed_on_step(state):
+            with observe_pilot_stages() as observed:
+                try:
+                    return original_on_step(state)
+                finally:
+                    on._recovery_pilot_stages = observed
+        on.step = observed_on_step
         audit = run_pair(off, on, pre)
+        audit["prefix_seconds"] = prefix_seconds
+        audit["pilot_stage_timings"] = on._recovery_pilot_stages
         audit["workflow_internal_state_audit"] = internal
         audit["pilot_artifact_directory"] = str(on._pilot_writer.root)
         try:
