@@ -111,6 +111,35 @@ def training_state_fingerprints(state: Any) -> dict[str, str]:
     return result
 
 
+def pre_step_component_record(state: Any) -> dict:
+    """Persist the complete common input before either measured step."""
+    params = state.agent_state.params
+    ec_state = state.ec_opt_state
+    replay = state.replay_buffer_state
+    counters = {
+        name: int(_host_array(getattr(state.metrics, name)))
+        for name in (
+            "iterations", "sampled_episodes", "sampled_timesteps",
+            "rl_sampled_timesteps",
+        )
+    }
+    return {
+        "actor": _hash_tree(params.actor_params),
+        "critic": _hash_tree(params.critic_params),
+        "target_actor": _hash_tree(params.target_actor_params),
+        "target_critic": _hash_tree(params.target_critic_params),
+        "actor_optimizer": _hash_tree(state.opt_state.actor),
+        "critic_optimizer": _hash_tree(state.opt_state.critic),
+        "ea_population": _hash_tree(ec_state.pop),
+        "ec_optimizer": _hash_tree(ec_state.replace(pop=None)),
+        "baseline_key": _hash_tree(state.key),
+        "replay_valid_slots": occupied_replay_fingerprint(replay),
+        "replay_pointer": int(_host_array(replay.current_index)),
+        "replay_size": int(_host_array(replay.buffer_size)),
+        "training_counters": counters,
+    }
+
+
 def state_leaf_differences(left: Any, right: Any) -> list[dict]:
     """Scalar device reductions only; Replay payload is limited to occupied slots."""
     differences = []
@@ -158,11 +187,19 @@ def state_leaf_differences(left: Any, right: Any) -> list[dict]:
             if aa.dtype.kind in "fc" and bb.dtype.kind in "fc":
                 entry["all_finite"] = bool(jax.device_get(
                     jnp.all(jnp.isfinite(aa)) & jnp.all(jnp.isfinite(bb))))
-                entry["max_absolute_difference"] = float(jax.device_get(
-                    jnp.max(jnp.abs(aa - bb), initial=0)))
+                if entry["all_finite"]:
+                    magnitude = jnp.abs(aa - bb)
+                    entry["max_absolute_difference"] = float(jax.device_get(
+                        jnp.max(magnitude, initial=0)))
+                    entry["mean_absolute_difference"] = float(jax.device_get(
+                        jnp.mean(magnitude)))
+                else:
+                    entry["max_absolute_difference"] = None
+                    entry["mean_absolute_difference"] = None
             else:
                 entry["all_finite"] = True
                 entry["max_absolute_difference"] = None
+                entry["mean_absolute_difference"] = None
             differences.append(entry)
     for field in REQUIRED_STATE:
         if field != "replay_buffer_state":
@@ -179,6 +216,80 @@ def state_leaf_differences(left: Any, right: Any) -> list[dict]:
         else:
             compare_tree(field + ".data", a.data, b.data, occupied=size_a)
     return differences
+
+
+
+def stage_numeric_differences(off_values: dict, on_values: dict,
+                              stage: str) -> list[dict]:
+    """Compare first divergent stage with scalar device reductions only."""
+    left, right = off_values.get(stage, {}), on_values.get(stage, {})
+    rows = []
+    for field in sorted(set(left) | set(right)):
+        prefix = stage + "." + field
+        if field not in left or field not in right:
+            rows.append({"path": prefix, "reason": "missing_field"})
+            continue
+        a, b = left[field], right[field]
+        if all(hasattr(x, name) for x in (a, b) for name in
+               ("data", "buffer_size", "current_index")):
+            fields = {
+                "buffer_size": (a.buffer_size, b.buffer_size, None),
+                "current_index": (a.current_index, b.current_index, None),
+            }
+            sa, sb = int(_host_array(a.buffer_size)), int(_host_array(b.buffer_size))
+            if sa != sb:
+                rows.append({"path": prefix + ".data",
+                             "reason": "occupied_size_mismatch",
+                             "left_size": sa, "right_size": sb})
+            else:
+                fields["data"] = (a.data, b.data, sa)
+        else:
+            fields = {"": (a, b, None)}
+        for suffix, (av, bv, occupied) in fields.items():
+            label = prefix + ("." + suffix if suffix else "")
+            la, ta = jtu.tree_flatten_with_path(av)
+            lb, tb = jtu.tree_flatten_with_path(bv)
+            if ta != tb or len(la) != len(lb):
+                rows.append({"path": label, "reason": "tree_structure_mismatch"})
+                continue
+            for (path, x), (_, y) in zip(la, lb):
+                name = label + "".join(
+                    "." + str(getattr(k, "key", getattr(k, "name",
+                                      getattr(k, "idx", k)))) for k in path)
+                xx, yy = jnp.asarray(x), jnp.asarray(y)
+                if occupied is not None:
+                    xx, yy = xx[:occupied], yy[:occupied]
+                row = {"path": name, "shape": list(xx.shape),
+                       "dtype": str(xx.dtype), "exact_equal": False}
+                if xx.shape != yy.shape or xx.dtype != yy.dtype:
+                    row.update(reason="shape_or_dtype_mismatch",
+                               other_shape=list(yy.shape),
+                               other_dtype=str(yy.dtype))
+                    rows.append(row)
+                    continue
+                count = int(jax.device_get(
+                    jnp.count_nonzero(jnp.logical_not(jnp.equal(xx, yy)))))
+                if count == 0:
+                    continue
+                row["different_elements"] = count
+                if xx.dtype.kind in "fc":
+                    finite = bool(jax.device_get(
+                        jnp.all(jnp.isfinite(xx)) & jnp.all(jnp.isfinite(yy))))
+                    row["all_finite"] = finite
+                    if finite:
+                        diff = jnp.abs(xx - yy)
+                        row["max_absolute_difference"] = float(
+                            jax.device_get(jnp.max(diff, initial=0)))
+                        row["mean_absolute_difference"] = float(
+                            jax.device_get(jnp.mean(diff))) if xx.size else 0.0
+                    else:
+                        row["max_absolute_difference"] = None
+                        row["mean_absolute_difference"] = None
+                else:
+                    row.update(all_finite=True, max_absolute_difference=None,
+                               mean_absolute_difference=None)
+                rows.append(row)
+    return rows
 
 
 def first_divergent_stage(off: dict, on: dict) -> str | None:
@@ -338,6 +449,16 @@ def run_pair(off: Any, on: Any, pre: Any, *,
         audit["available_stage_fingerprints"]["off"],
         audit["available_stage_fingerprints"]["on"],
     )
+    stage = audit["first_divergent_stage"]
+    if stage is not None:
+        audit["first_stage_leaf_differences"] = stage_numeric_differences(
+            getattr(off, "_recovery_stage_values", {}),
+            getattr(on, "_recovery_stage_values", {}), stage,
+        )
+        audit["first_mismatched_stage_leaf"] = (
+            audit["first_stage_leaf_differences"][0]["path"]
+            if audit["first_stage_leaf_differences"] else None
+        )
     if training_state_fingerprints(pre) != original:
         raise RecoveryHold("pre_step_state_mutation", "ON", {"audit": audit})
     for name in ("collectors", "ec_collectors", "rl_collectors", "replay_adds"):
@@ -401,6 +522,17 @@ def _instrument_rollouts(workflow: Any) -> None:
     workflow._recovery_counts = counts
 
 
+def _leaf_metadata(tree: Any) -> list[dict]:
+    rows = []
+    for leaf in jtu.tree_leaves(tree):
+        dtype = getattr(leaf, "dtype", None)
+        if dtype is None:
+            dtype = np.asarray(leaf).dtype
+        rows.append({"shape": list(getattr(leaf, "shape", ())),
+                     "dtype": str(dtype)})
+    return rows
+
+
 def instrument_baseline_stages(workflow: Any):
     """Observe eager boundaries of the existing step without extra execution.
 
@@ -410,6 +542,8 @@ def instrument_baseline_stages(workflow: Any):
     """
     records: dict[str, dict] = {}
     workflow._recovery_stage_fingerprints = records
+    values: dict[str, dict] = {}
+    workflow._recovery_stage_values = values
     replay = workflow.replay_buffer
     original_add = replay.add
     add_calls = 0
@@ -425,12 +559,15 @@ def instrument_baseline_stages(workflow: Any):
         record = {
             "replay_before": occupied_replay_fingerprint(buffer_state),
             "add_input": _hash_tree(xs),
+            "add_input_leaves": _leaf_metadata(xs),
             "mask": _hash_tree(mask) if mask is not None else None,
             "valid_transition_count": count,
         }
         result = original_add(buffer_state, xs, mask)
         record["replay_after"] = occupied_replay_fingerprint(result)
         records[name] = record
+        values[name] = {"replay_before": buffer_state, "add_input": xs,
+                        "mask": mask, "replay_after": result}
         return result
     # ReplayBuffer is a frozen PyTreeNode. Shadow only this instance's method
     # for the one audited step, then remove the shadow in the caller's finally.
@@ -443,17 +580,26 @@ def instrument_baseline_stages(workflow: Any):
         original = getattr(workflow, method)
         def observed_rollout(agent_state, replay_state, key,
                              _original=original, _family=family):
+            values[_family + "_rollout_input"] = {
+                "agent": agent_state, "key": key, "replay": replay_state,
+            }
             records[_family + "_rollout_input"] = {
                 "agent": _hash_tree(agent_state),
+                "agent_leaves": _leaf_metadata(agent_state),
                 "key": _hash_tree(key),
                 "replay": occupied_replay_fingerprint(replay_state),
             }
             metrics, trajectory, result_replay = _original(
                 agent_state, replay_state, key
             )
+            values[_family + "_rollout_output"] = {
+                "metrics": metrics, "transition_batch": trajectory,
+                "replay": result_replay,
+            }
             records[_family + "_rollout_output"] = {
                 "metrics": _hash_tree(metrics),
                 "transition_batch": _hash_tree(trajectory),
+                "transition_leaves": _leaf_metadata(trajectory),
                 "replay": occupied_replay_fingerprint(result_replay),
             }
             return metrics, trajectory, result_replay
@@ -469,6 +615,10 @@ def instrument_baseline_stages(workflow: Any):
         original = getattr(workflow, method)
         def observed_update(*args, _original=original, _label=label, **kwargs):
             if _label == "rl_learner_update":
+                values[_label + "_input"] = {
+                    "agent": args[0], "optimizer": args[1],
+                    "replay": args[2], "key": args[3],
+                }
                 records[_label + "_input"] = {
                     "agent": _hash_tree(args[0]),
                     "optimizer": _hash_tree(args[1]),
@@ -477,13 +627,19 @@ def instrument_baseline_stages(workflow: Any):
                     "num_updates": int(_host_array(args[4])) if len(args) > 4 else None,
                 }
             else:
+                values[_label + "_input"] = {
+                    "ec_optimizer": args[0], "fitnesses": args[-1],
+                    "learner_agent": args[1] if len(args) > 2 else None,
+                }
                 records[_label + "_input"] = {
                     "ec_optimizer": _hash_tree(args[0]),
                     "fitnesses": _hash_tree(args[-1]),
                     "learner_agent": _hash_tree(args[1]) if len(args) > 2 else None,
                 }
             result = _original(*args, **kwargs)
-            records[_label] = {"output": _hash_tree(result)}
+            values[_label] = {"output": result}
+            records[_label] = {"output": _hash_tree(result),
+                               "output_leaves": _leaf_metadata(result)}
             return result
         setattr(workflow, method, observed_update)
 
@@ -613,6 +769,12 @@ def _real_entry(run_dir: Path, overrides: list[str]) -> dict:
         # Workflow.init runs the sole real ten-iteration warmup prefix.
         pre, prefix_seconds = capture_pre_step(off, jax.random.PRNGKey(42))
         captured_pre = training_state_fingerprints(pre)
+        pre_components = pre_step_component_record(pre)
+        (run_dir / "pre_state.json").write_text(json.dumps(
+            {"complete_state_fingerprints": captured_pre,
+             "components": pre_components},
+            indent=2, sort_keys=True,
+        ))
         on = workflow_cls.build_from_config(on_config, enable_jit=False)
         if training_state_fingerprints(pre) != captured_pre:
             raise RecoveryHold("pre_step_state_mutation", "ON workflow build")
@@ -637,6 +799,7 @@ def _real_entry(run_dir: Path, overrides: list[str]) -> dict:
         except RecoveryHold as error:
             partial = error.details.setdefault("audit", {})
             partial.setdefault("pre_state_fingerprints", captured_pre)
+            partial.setdefault("pre_state_components", pre_components)
             partial.setdefault("available_stage_fingerprints", {
                 "off": getattr(off, "_recovery_stage_fingerprints", {}),
                 "on": getattr(on, "_recovery_stage_fingerprints", {}),
@@ -661,6 +824,7 @@ def _real_entry(run_dir: Path, overrides: list[str]) -> dict:
                 partial["pilot_hold_reason"] = pilot_error.reason
             raise
         audit["prefix_seconds"] = prefix_seconds
+        audit["pre_state_components"] = pre_components
         audit["pilot_stage_timings"] = on._recovery_pilot_stages
         audit["workflow_internal_state_audit"] = internal
         audit["pilot_artifact_directory"] = str(on._pilot_writer.root)

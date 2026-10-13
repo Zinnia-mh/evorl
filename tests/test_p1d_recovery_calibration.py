@@ -474,3 +474,62 @@ def test_call_count_hold_preserves_already_computed_post_hashes():
     assert audit["pre_state_fingerprints"]
     assert audit["off_post_fingerprints"]
     assert audit["on_post_fingerprints"]
+
+
+def test_pre_step_component_record_covers_training_state():
+    from scripts.p1d_recovery_calibration import pre_step_component_record
+    record = pre_step_component_record(make_state())
+    for name in ("actor", "critic", "target_actor", "target_critic",
+                 "actor_optimizer", "critic_optimizer", "ea_population",
+                 "ec_optimizer", "baseline_key", "replay_valid_slots",
+                 "replay_pointer", "replay_size", "training_counters"):
+        assert name in record
+    assert record["replay_pointer"] == 2
+    assert record["replay_size"] == 2
+
+
+def test_leaf_numeric_delta_reports_mean_absolute_difference():
+    from scripts.p1d_recovery_calibration import state_leaf_differences
+    pre = make_state()
+    changed_state = changed(pre, "critic", jnp.float32(9))
+    row = next(x for x in state_leaf_differences(pre, changed_state)
+               if "critic_params" in x["path"])
+    assert row["mean_absolute_difference"] == 7.0
+
+
+def test_stage_probe_records_leaf_shape_and_dtype():
+    from scripts.p1d_recovery_calibration import instrument_baseline_stages
+    real = ReplayBuffer(capacity=5, sample_batch_size=1)
+    workflow = SimpleNamespace(replay_buffer=real)
+    restore = instrument_baseline_stages(workflow)
+    try:
+        before = real.init(jnp.array(0, dtype=jnp.int32))
+        real.add(before, jnp.array([4, 5], dtype=jnp.int32))
+        leaves = workflow._recovery_stage_fingerprints["ea_replay_add"]["add_input_leaves"]
+        assert leaves == [{"shape": [2], "dtype": "int32"}]
+    finally:
+        restore()
+
+
+def test_stage_leaf_comparison_reports_numeric_magnitude():
+    from scripts.p1d_recovery_calibration import stage_numeric_differences
+    off = {"ea_rollout_output": {"transition_batch":
+           jnp.array([1.0, 2.0], dtype=jnp.float32)}}
+    on = {"ea_rollout_output": {"transition_batch":
+          jnp.array([1.0, 4.0], dtype=jnp.float32)}}
+    rows = stage_numeric_differences(off, on, "ea_rollout_output")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["path"].startswith("ea_rollout_output.transition_batch")
+    assert row["different_elements"] == 1
+    assert row["max_absolute_difference"] == 2.0
+    assert row["mean_absolute_difference"] == 1.0
+
+
+def test_stage_replay_comparison_excludes_unoccupied_tail():
+    from scripts.p1d_recovery_calibration import stage_numeric_differences
+    a = make_state(tail=0).replay_buffer_state
+    b = make_state(tail=99).replay_buffer_state
+    assert stage_numeric_differences({"ea_replay_add": {"replay_after": a}},
+                                     {"ea_replay_add": {"replay_after": b}},
+                                     "ea_replay_add") == []
