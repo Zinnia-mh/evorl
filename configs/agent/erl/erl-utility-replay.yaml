@@ -5,6 +5,7 @@ workflow_cls: evorl.algorithms.erl.erl_td3.erl_utility_replay.ERLUtilityReplayWo
 # Arm A keeps diagnostics disabled. Arms B/C/D enable the same frozen
 # checkpoint diagnostic and differ only in score_kind.
 arm: uniform
+arm_manifest_path: null
 score_kind: uniform
 alpha: 0
 replay_temperature: 1.0

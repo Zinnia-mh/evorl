@@ -1,6 +1,7 @@
 """Utility-replay pilot with pre-exposure diagnostic score lifecycle."""
 
 import time
+from numbers import Integral
 from typing import NamedTuple
 
 import chex
@@ -27,6 +28,7 @@ from evorl.utils.rl_toolkits import (
 )
 
 from .erl_origin import ERLTrainMetric, ERLWorkflow
+from .erl_ga import EvaluateMetric
 from .erl_learner_utility import ERLLearnerUtilityWorkflow
 from .learner_utility import derive_diagnostic_key, td3_critic_loss
 from .erl_td3_workflow import (
@@ -53,6 +55,21 @@ from .source_replay import (
     raise_for_score_table_status,
     update_resident_counts,
 )
+from .utility_replay_budget import BudgetAudit, validate_arm_config
+
+
+def _optimizer_step_count(opt_state):
+    """Read Optax Adam's actual step counter from its state tree."""
+    count = getattr(opt_state, "count", None)
+    if count is not None and not callable(count):
+        return int(jax.device_get(count))
+    if isinstance(opt_state, (tuple, list)):
+        for item in opt_state:
+            try:
+                return _optimizer_step_count(item)
+            except ValueError:
+                pass
+    raise ValueError("optimizer state has no observable step counter")
 
 
 _SCORE_KIND_BY_NAME = {
@@ -432,12 +449,16 @@ def make_ea_rollout_provenance(
     score_version: int | chex.Array = NO_SCORE_VERSION,
 ) -> ReplayProvenance:
     """Encode authoritative generation and individual identity for an EA rollout."""
-    generation = int(generation)
     population_size = int(population_size)
     time_size = int(time_size)
     episode_batch = int(episode_batch)
-    base_token = encode_source_token(generation, 0, population_size)
-    encode_source_token(generation, population_size - 1, population_size)
+    if isinstance(generation, Integral):
+        base_token = encode_source_token(generation, 0, population_size)
+        encode_source_token(generation, population_size - 1, population_size)
+    else:
+        # The warmup scan carries generation as a JAX scalar. Its upper bound
+        # is checked from the static warmup configuration at workflow build.
+        base_token = jnp.asarray(generation, dtype=jnp.int32) * population_size
     individual_ids = jnp.tile(
         jnp.repeat(jnp.arange(population_size, dtype=jnp.int32), episode_batch),
         time_size,
@@ -524,13 +545,20 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
         cls._ec_update_with_rl_injection = jax.jit(
             cls._ec_update_with_rl_injection, static_argnums=(0,)
         )
-        cls.evaluate = jax.jit(cls.evaluate, static_argnums=(0,))
+        cls._evaluate_with_count = jax.jit(
+            cls._evaluate_with_count, static_argnums=(0,)
+        )
         cls._postsetup_replaybuffer = jax.jit(
             cls._postsetup_replaybuffer, static_argnums=(0,)
         )
 
     @classmethod
     def _build_from_config(cls, config):
+        validate_arm_config(config)
+        encode_source_token(
+            int(config.warmup_iters), int(config.pop_size) - 1,
+            int(config.pop_size),
+        )
         alpha = float(config.alpha)
         if not 0.0 <= alpha <= 1.0:
             raise ValueError("alpha must be within [0, 1]")
@@ -596,7 +624,7 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
                     sampled.utility_replay_state,
                 ), None
 
-            if is_jitted(cls.evaluate):
+            if is_jitted(cls._evaluate_with_count):
                 _weighted_rl_sample_and_update_fn = jax.jit(
                     _weighted_rl_sample_and_update_fn
                 )
@@ -823,7 +851,9 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
 
     def step(self, state):
         if float(self.config.alpha) == 0.0:
-            return self._with_generation_context(state, super().step)
+            result = self._with_generation_context(state, super().step)
+            self._record_budget_step(state, result)
+            return result
 
         def operation(current_state):
             self._latest_score_lifecycle_audit = {
@@ -847,12 +877,98 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
                 del self._diagnostic_context
                 del self._diagnostic_active
 
-        return self._with_generation_context(state, operation)
+        result = self._with_generation_context(state, operation)
+        self._record_budget_step(state, result)
+        return result
+
+    def _record_budget_step(self, before, result):
+        audit = getattr(self, "_budget_audit", None)
+        if audit is None:
+            return
+        train_metrics, after = result
+        get_int = lambda value: int(jax.device_get(value))
+        expected_ec_key = jax.random.split(before.ec_opt_state.key, 4)[0]
+        observed_tell = int(bool(jax.device_get(jnp.array_equal(
+            after.ec_opt_state.key, expected_ec_key
+        ))))
+        audit.observe_step(
+            episodes=get_int(after.metrics.sampled_episodes - before.metrics.sampled_episodes),
+            timesteps=get_int(after.metrics.sampled_timesteps - before.metrics.sampled_timesteps),
+            rl_updates=get_int(train_metrics.num_updates_per_iter),
+            batch_size=int(self.replay_buffer.sample_batch_size),
+            ea_ask=self._observed_ec_rollouts,
+            ea_tell=observed_tell,
+            actor_optimizer_steps=(
+                _optimizer_step_count(after.opt_state.actor)
+                - _optimizer_step_count(before.opt_state.actor)
+            ),
+            critic_optimizer_steps=(
+                _optimizer_step_count(after.opt_state.critic)
+                - _optimizer_step_count(before.opt_state.critic)
+            ),
+        )
+        self._observed_ec_rollouts = 0
+
+    def learn(self, state):
+        """Validate pilot budget from observed state deltas at run completion."""
+        get_int = lambda value: int(jax.device_get(value))
+        audit = BudgetAudit(
+            self.config,
+            initial_episodes=get_int(state.metrics.sampled_episodes),
+            initial_iteration=get_int(state.metrics.iterations),
+            initial_timesteps=get_int(state.metrics.sampled_timesteps),
+        )
+        self._budget_audit = audit
+        self._observed_ec_rollouts = 0
+        try:
+            final_state = super().learn(state)
+            self._last_budget_audit = audit.finalize(
+                final_episodes=get_int(final_state.metrics.sampled_episodes),
+                final_iteration=get_int(final_state.metrics.iterations),
+                final_timesteps=get_int(final_state.metrics.sampled_timesteps),
+            )
+            return final_state
+        finally:
+            del self._budget_audit
+            del self._observed_ec_rollouts
+
+    def _evaluate_with_count(self, state):
+        """Baseline evaluation computation plus the raw result cardinality."""
+        key, eval_key = jax.random.split(state.key, num=2)
+        raw = jax.vmap(
+            self.evaluator.evaluate,
+            in_axes=(self.agent_state_vmap_axes, 0, None),
+        )(
+            state.agent_state,
+            jax.random.split(eval_key, self.config.num_rl_agents),
+            self.config.eval_episodes,
+        )
+        metrics = EvaluateMetric(
+            rl_episode_returns=raw.episode_returns.mean(-1),
+            rl_episode_lengths=raw.episode_lengths.mean(-1),
+        )
+        return metrics, state.replace(key=key), raw.episode_returns.size
+
+    def evaluate(self, state):
+        metrics, next_state, actual_episodes = self._evaluate_with_count(state)
+        audit = getattr(self, "_budget_audit", None)
+        if audit is not None:
+            audit.observe_eval(
+                int(jax.device_get(state.metrics.iterations)),
+                episodes=int(actual_episodes),
+            )
+        return metrics, next_state
 
     def warmup_step(self, state):
-        return self._with_generation_context(state, super().warmup_step)
+        self._provenance_generation = state.metrics.iterations + jnp.uint32(1)
+        try:
+            return super().warmup_step(state)
+        finally:
+            del self._provenance_generation
 
     def _ec_rollout(self, agent_state, replay_buffer_state, key):
+        if getattr(self, "_budget_audit", None) is not None:
+            self._observed_ec_rollouts += 1
         if getattr(self, "_diagnostic_active", False):
             return ERLLearnerUtilityWorkflow._ec_rollout(
                 self, agent_state, replay_buffer_state, key

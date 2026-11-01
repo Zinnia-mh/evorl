@@ -69,6 +69,10 @@ def train(config: DictConfig) -> None:
     logger.info("config:\n" + OmegaConf.to_yaml(config, resolve=True))
 
     workflow_cls = hydra.utils.get_class(config.workflow_cls)
+    if config.workflow_cls == "evorl.algorithms.erl.erl_td3.erl_utility_replay.ERLUtilityReplayWorkflow":
+        from evorl.algorithms.erl.erl_td3.utility_replay_budget import validate_arm_manifest
+
+        validate_arm_manifest(config)
     workflow_cls = type(workflow_cls.__name__, (workflow_cls,), {})
 
     devices = jax.local_devices()

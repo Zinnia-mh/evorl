@@ -346,7 +346,7 @@ def test_nonzero_alpha_builds_weighted_learner_closure(monkeypatch):
         return built
 
     monkeypatch.setattr(ERLWorkflow, "_build_from_config", classmethod(parent_build))
-    config = SimpleNamespace(alpha=0.5, actor_update_interval=2, num_rl_agents=1)
+    config = SimpleNamespace(arm="utility", score_kind="utility", diagnostic_enabled=True, freshness_window=3, min_resident=1, replay_temperature=1.0, alpha=0.5, actor_update_interval=2, num_rl_agents=1, warmup_iters=0, pop_size=2)
     result = ERLUtilityReplayWorkflow._build_from_config(config)
     assert result is built
     assert callable(result._rl_sample_and_update_fn)
@@ -378,7 +378,7 @@ def test_nonzero_workflow_without_distribution_is_neutral():
         )
         pilot_cfg = compose(
             config_name="config",
-            overrides=["agent=erl/erl-utility-replay", "alpha=0.8", *overrides],
+            overrides=["agent=erl/erl-utility-replay", "arm=utility", "score_kind=utility", "diagnostic_enabled=true", "alpha=0.8", *overrides],
         )
     baseline = ERLWorkflow.build_from_config(base_cfg, enable_jit=False)
     pilot = ERLUtilityReplayWorkflow.build_from_config(pilot_cfg, enable_jit=False)
@@ -414,7 +414,7 @@ def test_weighted_learner_closure_uses_final_indices_once(monkeypatch):
         return built
 
     monkeypatch.setattr(ERLWorkflow, "_build_from_config", classmethod(parent_build))
-    config = SimpleNamespace(alpha=0.8, actor_update_interval=2, num_rl_agents=1)
+    config = SimpleNamespace(arm="utility", score_kind="utility", diagnostic_enabled=True, freshness_window=3, min_resident=1, replay_temperature=1.0, alpha=0.8, actor_update_interval=2, num_rl_agents=1, warmup_iters=0, pop_size=2)
     workflow = ERLUtilityReplayWorkflow._build_from_config(config)
     _, _, _, replay_state = _filled_states()
     utility_state = init_utility_replay_state(
@@ -484,6 +484,9 @@ def test_prepared_distribution_advances_across_real_workflow_step():
             overrides=[
                 "agent=erl/erl-utility-replay",
                 "alpha=0.8",
+                "arm=utility",
+                "score_kind=utility",
+                "diagnostic_enabled=true",
                 "min_resident=1",
                 *overrides,
             ],
@@ -720,7 +723,7 @@ def test_weighted_learner_sampling_closure_runs_jitted():
         config = compose(
             config_name="config",
             overrides=[
-                "agent=erl/erl-utility-replay", "alpha=0.8", *overrides
+                "agent=erl/erl-utility-replay", "arm=utility", "score_kind=utility", "diagnostic_enabled=true", "alpha=0.8", *overrides
             ],
         )
     workflow = ERLUtilityReplayWorkflow.build_from_config(config, enable_jit=True)
@@ -878,6 +881,7 @@ def _phase8_tiny_workflow(*, enable_eval_loss_endpoint=False):
         "num_eval_envs=1",
         "eval_episodes=1",
         "alpha=0.8",
+        "arm=utility",
         "score_kind=utility",
         "diagnostic_enabled=true",
         "diagnostic_interval=1",
