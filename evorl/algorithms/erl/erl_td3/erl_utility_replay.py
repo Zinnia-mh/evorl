@@ -851,8 +851,13 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
 
     def step(self, state):
         if float(self.config.alpha) == 0.0:
+            observer = getattr(self, "_calibration_observer", None)
+            if observer is not None:
+                observer.begin(self, state)
             result = self._with_generation_context(state, super().step)
             self._record_budget_step(state, result)
+            if observer is not None:
+                observer.finish(self, result[1])
             return result
 
         def operation(current_state):
@@ -967,6 +972,7 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
             del self._provenance_generation
 
     def _ec_rollout(self, agent_state, replay_buffer_state, key):
+        pre_insertion_replay = replay_buffer_state
         if getattr(self, "_budget_audit", None) is not None:
             self._observed_ec_rollouts += 1
         if getattr(self, "_diagnostic_active", False):
@@ -986,7 +992,18 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
             generation=self._provenance_generation,
             origin="ea",
         )
+        observer = getattr(self, "_calibration_observer", None)
+        if observer is not None and hasattr(observer, "context"):
+            observer.score(self, pre_insertion_replay, metrics, trajectory)
         return metrics, trajectory, replay_buffer_state
+
+    def attach_calibration_observer(self, observer):
+        """Attach only to an isolated, validated uniform calibration workflow."""
+        if self.config.arm != "uniform" or float(self.config.alpha) != 0 or self._diagnostic_enabled:
+            raise ValueError("calibration observer requires baseline uniform arm")
+        if hasattr(self, "_calibration_observer"):
+            raise ValueError("calibration observer already attached")
+        self._calibration_observer = observer
 
     def _process_pre_exposure_ec_trajectory(
         self,
