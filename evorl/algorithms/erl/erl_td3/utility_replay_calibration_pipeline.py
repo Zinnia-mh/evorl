@@ -100,7 +100,7 @@ class CalibrationObserver:
         del self.context
 
 
-def simulate(meta, arrays, reg, *, draws=1024):
+def validate_snapshot_inputs(meta, arrays):
     def reject_outcomes(value):
         if isinstance(value,dict):
             for key,item in value.items():
@@ -146,6 +146,11 @@ def simulate(meta, arrays, reg, *, draws=1024):
             raise ValueError('invalid registered checkpoint rank')
     measured=np.array([int(t) in by_token for t in tokens])
     if not measured.any(): raise ValueError('no measured resident sources at analysis boundary')
+    return generation,ea,tokens,counts,by_token,measured
+
+
+def simulate(meta, arrays, reg, *, draws=1024):
+    generation,ea,tokens,counts,by_token,measured=validate_snapshot_inputs(meta,arrays)
     rows=[]; details=[]
     for candidate_id,candidate in enumerate(reg['candidates']):
         observations=[]
