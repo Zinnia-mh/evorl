@@ -56,6 +56,7 @@ from .source_replay import (
     update_resident_counts,
 )
 from .utility_replay_budget import BudgetAudit, validate_arm_config
+from .source_residency_batch import recount_resident_sources
 
 
 def _optimizer_step_count(opt_state):
@@ -250,19 +251,14 @@ def refresh_replay_distribution(
     final_tokens = jnp.where(
         resident_ea, replay_buffer_state.source_token, -1
     ).astype(jnp.int32)
-    reset_counts = utility_replay_state.score_table._replace(
-        resident_count=jnp.zeros_like(
-            utility_replay_state.score_table.resident_count
-        )
-    )
-    recounted = update_resident_counts(
-        reset_counts,
-        resident_source_tokens=jnp.full((capacity,), -1, dtype=jnp.int32),
-        write_indices=indices,
-        new_source_tokens=final_tokens,
-        mask=resident_ea,
+    residency_start = time.perf_counter()
+    recounted = recount_resident_sources(
+        utility_replay_state.score_table, final_tokens, resident_ea
     )
     raise_for_score_table_status(recounted.status)
+    if timing_sink is not None:
+        jax.block_until_ready(recounted)
+        timing_sink["resident_count_seconds"] = time.perf_counter() - residency_start
     eligibility_start = time.perf_counter()
     eligibility = compute_source_eligibility(
         recounted.table,
@@ -271,6 +267,7 @@ def refresh_replay_distribution(
         min_resident=min_resident,
     )
     if timing_sink is not None:
+        jax.block_until_ready(eligibility)
         timing_sink["eligibility_seconds"] = (
             time.perf_counter() - eligibility_start
         )
@@ -283,6 +280,7 @@ def refresh_replay_distribution(
         replay_temperature=replay_temperature,
     )
     if timing_sink is not None:
+        jax.block_until_ready(distribution)
         timing_sink["distribution_refresh_seconds"] = (
             time.perf_counter() - distribution_start
         )
@@ -592,6 +590,7 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
                     utility_replay_state,
                     workflow.replay_buffer.sample_batch_size,
                 )
+                workflow._observe_weighted_replay_draws(sampled, replay_buffer_state)
                 sample_batches = jtu.tree_map(
                     lambda x: x.reshape(
                         (
@@ -636,6 +635,10 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
     def _generation_from_state(self, state) -> int:
         """Use the frozen diagnostic-v1 definition of the active generation."""
         return int(jax.device_get(state.metrics.iterations)) + 1
+
+    def _observe_weighted_replay_draws(self, sampled, replay_buffer_state):
+        """No-op seam; only the isolated Smoke subclass records actual draws."""
+        del sampled, replay_buffer_state
 
     def _with_generation_context(self, state, operation):
         self._provenance_generation = self._generation_from_state(state)
