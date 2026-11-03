@@ -51,13 +51,42 @@ source/statistics files; their prior passing evidence is reused.
 
 ## Four-arm acceptance
 
-Common resolved configuration, seed, full initialized-state fingerprint,
-training/evaluation budget and population-operation counters must match.
+The user-approved `matched-settings-and-budget-v1` policy requires common
+resolved initialization settings, seed, networks, environment, EA/RL mechanisms,
+training/evaluation budget and population-operation counters. Only the four
+preregistered arm fields (arm, score_kind, alpha, diagnostic_enabled) are excluded
+from the shared resolved-settings fingerprint. The runner fingerprints its
+actual workflow config, and output acceptance binds the saved config and report
+to the immutable manifest. Full post-warmup state fingerprints remain recorded
+for provenance; they are not cross-process equality gates.
+
+Phase 12-C established exact equality of 109 pre-warmup Pilot state leaves in
+A1/A2/B1, and equality of all 105 shared initial leaves with Original ERL.
+Original ERL and isolated Brax reset/step reproduced GPU non-repeatability on
+identical inputs, including one identical compiled rollout executable. Evidence
+is retained under the external diagnostics/phase12c-first-divergence-v1-head6b2d0ee
+directory. The exact native primitive remains unresolved; no baseline, simulator
+or GPU configuration was changed to suppress it. No common-checkpoint protocol
+is introduced. These known simulator differences do not waive any PRNG, sampling,
+data-validity or actual-budget gate.
 Within each run, RL indices/origins, optimizer counts and original PRNG
 transitions remain strict. Cross-arm post-learning Replay payloads, realized
 EA/RL slot counts and draw hashes may legitimately differ through feedback;
 they are not equality gates. A requires zero intervention; B/C/D require an
-observable non-neutral intervention after their scoring checkpoint.
+observable non-neutral intervention at generation 20, with valid resident scores,
+a prepared distribution, eligible sources and changed EA indices. Reconstruction
+is bound to the actual TD3 learner inputs; direct-index equivalence tests and
+actual optimizer-counter/key checks remain required. Each arm is validated before
+the next starts; single-arm acceptance never claims four-arm budget equality.
+
+ESS acceptance uses Host float64 normalized variance:
+mean(p)^2 / (mean(p)^2 + mean((p-mean(p))^2)), over resident sources.
+This equals normalized ESS fraction without clipping and does not modify p or
+CDF. The original float32 ESS, probability masses, squared mass and CDF interval
+error remain in every row. `effective_eligible_mass` is explicitly alpha times
+eligible_baseline_mass; it is not the fraction of changed indices. EA replacement
+counts include resampling within the neutral component and must not be presented
+as the magnitude of the Utility probability tilt.
 
 The short budget keeps the formal one-million Replay capacity, population,
 networks, batch and scoring parameters. Seed 1, Swimmer horizon 1000, warmup 10
@@ -75,7 +104,7 @@ Run inside `evorl-utility:review`, after committing and checking a clean tree:
 cd /disk1/zmh_projects/evorl
 PYTHON_BIN=/home/admin001/anaconda3/envs/evorl-conflict/bin/python
 FROZEN=/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/calibration/phase11b-selected-v2-head-dbcb4f9-seed104729
-SMOKE=/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/smoke/swimmer/seed_1/phase12a-v2
+SMOKE=/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/smoke/swimmer/seed_1/phase12b-v3-matched-settings-head$(git rev-parse --short=8 HEAD)
 env -u LD_LIBRARY_PATH "$PYTHON_BIN" scripts/run_utility_replay_smoke.py prepare \
   --frozen "$FROZEN" --directory "$SMOKE" --seed 1
 ```
@@ -90,6 +119,8 @@ mkdir -p "$SMOKE/logs"
 for arm in A B C D; do
   env -u LD_LIBRARY_PATH "$PYTHON_BIN" scripts/run_utility_replay_smoke.py run-arm \
     --directory "$SMOKE" --arm "$arm" > "$SMOKE/logs/$arm.log" 2>&1
+  env -u LD_LIBRARY_PATH "$PYTHON_BIN" scripts/run_utility_replay_smoke.py validate \
+    --directory "$SMOKE" --arm "$arm"
 done
 env -u LD_LIBRARY_PATH "$PYTHON_BIN" scripts/run_utility_replay_smoke.py validate \
   --directory "$SMOKE"

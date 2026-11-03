@@ -7,6 +7,7 @@ import numpy as np
 from .erl_utility_replay import (ERLUtilityReplayWorkflow,alpha_zero_sample,weighted_replay_sample,weighted_replay_draws,_optimizer_step_count)
 from .source_replay import compute_source_eligibility,build_weighted_source_distribution,draw_baseline_indices
 from .source_residency_batch import recount_resident_sources
+from .replay_distribution_audit import audit_distribution
 
 class DrawRecorder:
     def __init__(self):self.lock=threading.Lock();self.reset()
@@ -128,6 +129,10 @@ class SmokeWorkflow(ERLUtilityReplayWorkflow):
         for leaf in jax.tree.leaves((after.agent_state,after.opt_state)):
             if hasattr(leaf,'dtype') and jnp.issubdtype(leaf.dtype,jnp.inexact):finite=finite and bool(jax.device_get(jnp.all(jnp.isfinite(leaf))))
         lifecycle=getattr(self,'_latest_score_lifecycle_audit',{})
+        # Host-only evidence; the distribution and all learner inputs remain
+        # untouched. Retain the original device ESS alongside normalized ESS.
+        p,t,cdf,ea_host=jax.device_get((dist.source_probability,dist.transition_probability,dist.transition_cdf,ea))
+        numerical=audit_distribution(p,counts,t,cdf,ea_host,float(dist.ess_fraction))
         result=dict(self.draw_recorder.summary(),generation=g,finite=finite,training_seconds=training_seconds,
             probability_l1=float(jax.device_get(jnp.sum(jnp.abs(dist.source_probability-dist.baseline_source_probability)))),
             eligible_baseline_mass=float(dist.eligible_baseline_mass),ess_fraction=float(dist.ess_fraction),max_source_probability=float(dist.max_source_probability),
@@ -140,5 +145,11 @@ class SmokeWorkflow(ERLUtilityReplayWorkflow):
             diagnostic_seconds=float(lifecycle.get('diagnostic_seconds',0)),resident_count_seconds=float(lifecycle.get('resident_count_seconds',0)),distribution_refresh_seconds=float(lifecycle.get('distribution_refresh_seconds',0)),
             actor_optimizer_steps=_optimizer_step_count(after.opt_state.actor)-_optimizer_step_count(before.opt_state.actor),
             critic_optimizer_steps=_optimizer_step_count(after.opt_state.critic)-_optimizer_step_count(before.opt_state.critic))
+        result.update(numerical)
+        result.update(distribution_prepared=bool(after.utility_replay_state.distribution_prepared),
+            eligible_source_count=int(dist.eligible_source_count),
+            valid_score_source_count=int(np.sum((counts>0)&np.asarray(valid)&scored&(age>=0)&(age<=int(c.freshness_window))&(np.asarray(table.version)==int(table.current_version)))),
+            effective_eligible_mass=float(c.alpha)*float(dist.eligible_baseline_mass))
+        result['ess_fraction']=numerical['ess_fraction_audit64']
         result['observer_seconds']=time.perf_counter()-start
         return result

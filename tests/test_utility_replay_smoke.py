@@ -9,9 +9,9 @@ FROZEN=Path('/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/ca
 def add_provenance(reports):
     for a,report in reports.items():
         kind=dict(A='uniform',B='fitness',C='td',D='utility')[a]
-        report.update(seed=1,initialization_sha256='a'*64)
+        report.update(seed=1,initialization_sha256='a'*64,initialization_settings_sha256='f'*64,fairness_policy='matched-settings-and-budget-v1')
         report['budget'].update(arm=kind,score_kind=kind)
-        for row in report['rows']:row.update(baseline_prng_transition_verified=True,intervention_terminal_key_verified=True,sampling_observation='deterministic_reconstruction')
+        for row in report['rows']:row.update(baseline_prng_transition_verified=True,intervention_terminal_key_verified=True,sampling_observation='deterministic_reconstruction',valid_score_source_count=0 if a=='A' else 4,distribution_prepared=a!='A',eligible_source_count=0 if a=='A' else 4,effective_eligible_mass=0 if a=='A' else .05)
 
 def test_smoke_manifest_uses_one_environment_one_seed_four_arms(tmp_path):
     root=tmp_path/'smoke';m=prepare_smoke(FROZEN,root,seed=1,commit='a'*40)
@@ -39,6 +39,7 @@ def test_smoke_output_validator_checks_all_gate_counters(tmp_path):
 
 def test_all_four_prepared_configs_build_through_formal_manifest_checks(tmp_path):
     from evorl.algorithms.erl.erl_td3.utility_replay_smoke_workflow import SmokeWorkflow
+    from evorl.algorithms.erl.erl_td3.utility_replay_smoke import initialization_settings_fingerprint
     from evorl.algorithms.erl.erl_td3.utility_replay_budget import validate_arm_manifest
     root=tmp_path/'smoke';manifest=prepare_smoke(FROZEN,root,seed=1,commit='a'*40)
     verify_smoke_manifest(root)
@@ -46,6 +47,7 @@ def test_all_four_prepared_configs_build_through_formal_manifest_checks(tmp_path
         config=OmegaConf.load(root/manifest['configs'][label]);validate_arm_manifest(config)
         workflow=type('Preflight'+label,(SmokeWorkflow,),{}).build_from_config(config,enable_jit=True)
         assert workflow.replay_buffer.capacity==1000000 and workflow.config.score_kind==config.score_kind
+        assert initialization_settings_fingerprint(workflow.config)==manifest['initialization_settings_sha256']
 
 @pytest.mark.parametrize('field,value',[('rl_updates',9),('environment_timesteps',2),('ea_ask',0),('evaluation_episodes',8),('batch_size',1)])
 def test_smoke_budget_mismatch_or_missing_audit_is_rejected(field,value):

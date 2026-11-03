@@ -6,6 +6,30 @@ from .utility_replay_budget import validate_arm_set,validate_arm_manifest,prepar
 
 STEPS=12
 LABELS='ABCD'
+FAIRNESS_POLICY='matched-settings-and-budget-v1'
+def initialization_settings_fingerprint(config):
+    values=OmegaConf.to_container(config,resolve=True)
+    # The only preregistered arm differences; all other resolved settings,
+    # including seed, networks, environment, EA/RL mechanisms and budgets bind.
+    for name in ['arm','score_kind','alpha','diagnostic_enabled']:values.pop(name,None)
+    return hashlib.sha256(json.dumps(values,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+def validate_ess_evidence(row):
+    # Legacy records retain the original strict bound check below. An audit
+    # version cannot be used to silently waive it without numerical evidence.
+    if 'ess_audit_version' not in row:
+        if any(k in row for k in ['ess_raw_float32','ess_fraction_audit64','source_probability_squared_mass64']):raise ValueError('missing ESS audit version')
+        return
+    names=['ess_raw_float32','ess_fraction_audit64','effective_source_count_audit64','source_count','source_probability_mass64','source_probability_squared_mass64','transition_probability_mass64','cdf_sampling_mass64','cdf_probability_max_abs_error','cdf_non_ea_interval_mass64']
+    if row['ess_audit_version']!='normalized-variance-float64-v1' or any(k not in row for k in names):raise ValueError('missing/unknown ESS audit')
+    if any(not isinstance(row[k],(int,float)) or not math.isfinite(row[k]) for k in names):raise ValueError('nonfinite ESS evidence')
+    n=row['source_count'];mass=row['source_probability_mass64'];squares=row['source_probability_squared_mass64'];fraction=row['ess_fraction_audit64']
+    if n<0 or int(n)!=n or not 0<=fraction<=1 or row['ess_fraction']!=fraction:raise ValueError('invalid ESS evidence')
+    if not math.isclose(row['effective_source_count_audit64'],n*fraction,rel_tol=1e-12,abs_tol=1e-12):raise ValueError('ESS count mismatch')
+    if n:
+        if abs(mass-1)>1e-5 or abs(row['transition_probability_mass64']-1)>1e-5 or squares<=0:raise ValueError('ESS mass mismatch')
+        if not math.isclose(fraction,mass*mass/(n*squares),rel_tol=1e-12,abs_tol=1e-12) or row['cdf_sampling_mass64']!=1:raise ValueError('ESS reference mismatch')
+    elif any(row[k]!=0 for k in ['ess_fraction','source_probability_mass64','source_probability_squared_mass64','transition_probability_mass64','cdf_sampling_mass64']):raise ValueError('invalid empty ESS')
+    if row['cdf_probability_max_abs_error']<0 or not 0<=row['cdf_non_ea_interval_mass64']<=1:raise ValueError('invalid CDF evidence')
 def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 def write(path,value):
     with Path(path).open('x') as f:json.dump(value,f,sort_keys=True,allow_nan=False,indent=2)
@@ -48,7 +72,10 @@ def prepare_smoke(frozen,directory,*,seed,commit):
     directory.mkdir(parents=True,exist_ok=False)
     for a,c in zip(LABELS,configs):OmegaConf.save(c,directory/f'arm_{a}.yaml',resolve=True)
     prepare_arm_manifest(configs,directory/'arm_manifest.json')
+    settings={initialization_settings_fingerprint(c) for c in configs}
+    if len(settings)!=1:raise ValueError('shared initialization settings mismatch')
     manifest=dict(schema=2,kind='smoke-preflight',commit=commit,seed=seed,environment='swimmer',steps=STEPS,
+        fairness_policy=FAIRNESS_POLICY,initialization_settings_sha256=settings.pop(),
         configs={a:f'arm_{a}.yaml' for a in LABELS},frozen_directory=str(frozen),
         frozen_checksums_sha256=sha(frozen/'checksums.sha256'),frozen_resolved_sha256=sha(frozen/'resolved_config.yaml'),
         source_collection_commit=resolved['analysis_provenance']['collection_commit'],source_analysis_commit=resolved['analysis_provenance']['analysis_commit'],
@@ -68,18 +95,22 @@ def verify_smoke_manifest(directory):
     for c in configs:
         validate_arm_manifest(c)
         if c.seed!=m['seed'] or c.total_episodes!=716 or c.replay_buffer_capacity!=1000000 or c.batch_size!=256 or c.rl_updates_frac!=.001:raise ValueError('Smoke budget mismatch')
+    if 'fairness_policy' in m:
+        if m['fairness_policy']!=FAIRNESS_POLICY or any(initialization_settings_fingerprint(c)!=m.get('initialization_settings_sha256') for c in configs):raise ValueError('shared initialization settings mismatch')
     return m
 
-def validate_reports(reports):
-    if set(reports)!=set(LABELS):raise ValueError('missing arm')
+def validate_reports(reports,*,require_all=True):
+    if (require_all and set(reports)!=set(LABELS)) or not reports or not set(reports)<=set(LABELS):raise ValueError('missing arm')
     expected=dict(configured_total_episodes=716,environment_episodes=396,environment_timesteps=396000,rl_updates=192,batch_size=256,ea_ask=12,ea_tell=12,evaluation_checkpoints=[20,22],evaluation_episodes=4)
     baseline=None;common_initialization=None;common_seed=None
-    for a in LABELS:
+    for a in sorted(reports):
         report=reports[a]
         initial_hash=report.get('initialization_sha256','');seed=report.get('seed')
-        if len(initial_hash)!=64 or seed not in [1,2,3]:raise ValueError('missing common initialization/seed audit')
-        if common_initialization is None:common_initialization=initial_hash;common_seed=seed
-        elif initial_hash!=common_initialization or seed!=common_seed:raise ValueError('common initialization/seed mismatch')
+        settings=report.get('initialization_settings_sha256','')
+        hexadecimal=lambda value:isinstance(value,str) and len(value)==64 and all(x in '0123456789abcdef' for x in value)
+        if not hexadecimal(initial_hash) or not hexadecimal(settings) or seed not in [1,2,3] or report.get('fairness_policy')!=FAIRNESS_POLICY:raise ValueError('missing initialization settings/seed audit')
+        if common_initialization is None:common_initialization=settings;common_seed=seed
+        elif settings!=common_initialization or seed!=common_seed:raise ValueError('common initialization settings/seed mismatch')
         if not report.get('complete') or any(k not in report.get('budget',{}) for k in expected):raise ValueError('missing budget audit')
         budget={k:report['budget'][k] for k in expected}
         if budget!=expected or (baseline is not None and budget!=baseline):raise ValueError('actual budget mismatch')
@@ -90,6 +121,7 @@ def validate_reports(reports):
         rows=report.get('rows',[])
         if [r['generation'] for r in rows]!=list(range(11,23)):raise ValueError('missing generation audit')
         for r in rows:
+            validate_ess_evidence(r)
             required=['observed_batches','ea_slots','rl_slots','changed_ea','rl_changed','origin_changed','finite','probability_l1','eligible_baseline_mass','ess_fraction','reference_fingerprints','freshness_probe_neutral','sampling_probe_seconds','actor_optimizer_steps','critic_optimizer_steps','baseline_draw_sha256','fresh_fraction','expired_fraction','unscored_fraction','baseline_prng_transition_verified','intervention_terminal_key_verified','sampling_observation']
             if any(k not in r for k in required):raise ValueError('missing sampling audit')
             if not r['finite'] or r['rl_changed'] or r['origin_changed'] or not r['freshness_probe_neutral']:raise ValueError('sampling invariant failure')
@@ -105,12 +137,18 @@ def validate_reports(reports):
         if a!='A':
             if not any(r['probability_l1']>1e-8 and r['eligible_baseline_mass']>0 and r['changed_ea']>0 for r in rows if r['generation']>=20):raise ValueError('no observable weighted intervention')
             if not any(r['reference_fingerprints'] for r in rows if r['generation']==20):raise ValueError('missing pre-exposure reference audit')
-    return dict(status='PASS',arms=list(LABELS),budget=baseline,actual_runtime_budget_equal=True)
+            checkpoint=next(r for r in rows if r['generation']==20)
+            if not (checkpoint.get('valid_score_source_count',0)>0 and checkpoint.get('distribution_prepared') is True and checkpoint.get('eligible_source_count',0)>0 and checkpoint['probability_l1']>1e-8 and checkpoint['changed_ea']>0):raise ValueError('checkpoint has no valid actual weighted intervention')
+    return dict(status='PASS' if require_all else 'PASS_SINGLE_ARM',arms=sorted(reports),budget=baseline,actual_runtime_budget_equal=require_all,fairness_policy=FAIRNESS_POLICY,initialization_settings_sha256=common_initialization,postwarmup_state_sha256={a:r['initialization_sha256'] for a,r in reports.items()},postwarmup_bitwise_equality_required=False)
 
-def validate_smoke_outputs(directory):
-    directory=Path(directory);verify_smoke_manifest(directory);reports={}
-    for a in LABELS:
+def validate_smoke_outputs(directory,arm=None):
+    directory=Path(directory);manifest=verify_smoke_manifest(directory);reports={}
+    for a in LABELS if arm is None else [arm]:
         p=directory/a/'report.json'
         if not p.is_file():raise ValueError(f'missing arm output {a}')
         verify(p.parent,'checksums.sha256');reports[a]=json.loads(p.read_text())
-    return validate_reports(reports)
+        actual=OmegaConf.load(p.parent/'resolved_config.yaml')
+        expected=OmegaConf.load(directory/manifest['configs'][a])
+        if OmegaConf.to_container(actual,resolve=True)!=OmegaConf.to_container(expected,resolve=True):raise ValueError('actual run config differs from registered config')
+        if reports[a].get('initialization_settings_sha256')!=manifest.get('initialization_settings_sha256') or initialization_settings_fingerprint(actual)!=manifest.get('initialization_settings_sha256'):raise ValueError('actual initialization settings differ from manifest')
+    return validate_reports(reports,require_all=arm is None)

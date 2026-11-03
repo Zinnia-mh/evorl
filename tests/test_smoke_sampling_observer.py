@@ -33,6 +33,9 @@ def test_actual_jitted_observer_preserves_all_state_and_proves_indices(mode):
         chex.assert_trees_all_equal(s1,s2);chex.assert_trees_all_equal(a.num_updates_per_iter,b.num_updates_per_iter)
         assert int(s2.metrics.iterations)==generation
         row=observed._latest_smoke_audit;rows.append(row)
+        assert 0<=row['ess_fraction']==row['ess_fraction_audit64']<=1
+        assert row['ess_audit_version']=='normalized-variance-float64-v1'
+        assert row['effective_eligible_mass']==float(c.alpha)*row['eligible_baseline_mass']
         assert row['rl_changed']==0 and row['origin_changed']==0
         assert row['sampling_observation']=='deterministic_reconstruction'
         assert row['baseline_prng_transition_verified'] and row['intervention_terminal_key_verified']
@@ -41,6 +44,8 @@ def test_actual_jitted_observer_preserves_all_state_and_proves_indices(mode):
         assert checkpoint_inputs is not None and bool(checkpoint_inputs[-1].distribution_prepared)
         assert bool(jnp.any(checkpoint_inputs[-1].score_table.validity))
         assert any(r['probability_l1']>0 and r['changed_ea']>0 for r in rows if r['generation']>=10)
+        active=[r for r in rows if r['probability_l1']>0]
+        assert all(r['valid_score_source_count']>0 and r['eligible_source_count']>0 and r['distribution_prepared'] for r in active)
     elif mode=='neutral':
         assert checkpoint_inputs is not None and not bool(checkpoint_inputs[-1].distribution_prepared)
         assert all(r['probability_l1']==0 and r['changed_ea']==0 for r in rows)
