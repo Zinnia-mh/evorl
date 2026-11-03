@@ -22,6 +22,7 @@ def run_arm(directory,arm):
     write(output/'manifest.json',dict(smoke_manifest=str(directory/'smoke_manifest.json'),arm=arm,commit=head()))
     OmegaConf.save(c,output/'resolved_config.yaml',resolve=True)
     workflow=type(f'SmokeArm{arm}',(SmokeWorkflow,),{}).build_from_config(c,enable_jit=True)
+    workflow._smoke_audit_directory=output/'audit'
     actual_settings_hash=initialization_settings_fingerprint(workflow.config)
     if actual_settings_hash!=m['initialization_settings_sha256']:raise ValueError('workflow resolved settings mismatch')
     def counters(state):return dict(episodes=int(state.metrics.sampled_episodes),timesteps=int(state.metrics.sampled_timesteps),generation=int(state.metrics.iterations))
@@ -29,6 +30,7 @@ def run_arm(directory,arm):
     try:
         state=workflow.setup(jax.random.PRNGKey(int(c.seed)));initial=counters(state)
         initial_hash=initialization_fingerprint(state)
+        write(output/'audit/initialization.json',dict(counters=initial,state_sha256=initial_hash,initialization_settings_sha256=actual_settings_hash,seed=int(c.seed)))
         audit=BudgetAudit(c,initial_episodes=initial['episodes'],initial_iteration=initial['generation'],initial_timesteps=initial['timesteps'])
         workflow._budget_audit=audit;workflow._observed_ec_rollouts=0
         with (output/'progress.jsonl').open('x') as log:

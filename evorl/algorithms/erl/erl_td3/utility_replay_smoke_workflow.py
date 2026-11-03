@@ -1,5 +1,6 @@
 """Host-only Smoke audit; index reconstruction never enters the learner graph."""
-import hashlib,threading,time
+import hashlib,json,threading,time
+from pathlib import Path
 from functools import partial
 from typing import NamedTuple
 import jax,jax.numpy as jnp
@@ -132,7 +133,20 @@ class SmokeWorkflow(ERLUtilityReplayWorkflow):
         # Host-only evidence; the distribution and all learner inputs remain
         # untouched. Retain the original device ESS alongside normalized ESS.
         p,t,cdf,ea_host=jax.device_get((dist.source_probability,dist.transition_probability,dist.transition_cdf,ea))
-        numerical=audit_distribution(p,counts,t,cdf,ea_host,float(dist.ess_fraction))
+        cdf_used=float(c.alpha)>0 and bool(after.utility_replay_state.distribution_prepared)
+        def save_cdf_evidence(details):
+            directory=getattr(self,'_smoke_audit_directory',None)
+            if directory is None:return
+            directory=Path(directory)
+            target=directory/f'cdf_generation_{g}.npz'
+            if target.exists():raise FileExistsError(target)
+            np.savez_compressed(target,source_probability=p,resident_count=counts,transition_probability=t,transition_cdf=cdf,ea_mask=ea_host)
+            details=dict(details,generation=g,cdf_in_training_sampling=cdf_used,environment_episodes=int(after.metrics.sampled_episodes),environment_timesteps=int(after.metrics.sampled_timesteps),actor_optimizer_count=_optimizer_step_count(after.opt_state.actor),critic_optimizer_count=_optimizer_step_count(after.opt_state.critic))
+            with (directory/f'cdf_generation_{g}.json').open('x') as f:json.dump(details,f,sort_keys=True,allow_nan=False)
+        try:numerical=audit_distribution(p,counts,t,cdf,ea_host,float(dist.ess_fraction),cdf_in_training_sampling=cdf_used)
+        except ValueError as error:
+            save_cdf_evidence(dict(error=str(error)));raise
+        if not numerical['cdf_valid_for_sampling'] or not numerical['cdf_monotonic_raw']:save_cdf_evidence(numerical)
         result=dict(self.draw_recorder.summary(),generation=g,finite=finite,training_seconds=training_seconds,
             probability_l1=float(jax.device_get(jnp.sum(jnp.abs(dist.source_probability-dist.baseline_source_probability)))),
             eligible_baseline_mass=float(dist.eligible_baseline_mass),ess_fraction=float(dist.ess_fraction),max_source_probability=float(dist.max_source_probability),

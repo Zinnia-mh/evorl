@@ -88,6 +88,22 @@ eligible_baseline_mass; it is not the fraction of changed indices. EA replacemen
 counts include resampling within the neutral component and must not be presented
 as the magnitude of the Utility probability tilt.
 
+CDF audit scope follows actual use: uniform A and unprepared distributions do
+not feed a CDF into training. Their raw CDF anomalies are retained as diagnostics.
+An active weighted CDF must be finite/nonnegative, cover the upper boundary,
+and agree with the monotone float64 cumulative reference from its nonnegative
+transition probabilities. The error allowance is the dtype/length gamma_n
+forward-summation bound, capped at the existing 1e-5 probability tolerance.
+Raw monotonicity, negative increments, reference error and the bound are recorded;
+small dtype-consistent reversals are not silently converted into exact monotonicity.
+Production CDF, probabilities, RNG and sampler code remain unchanged. Anomalies
+save raw arrays plus runtime counters under audit/cdf_generation_<g>.npz/json;
+initialization SHA/counters are saved before the first training step.
+The legacy cdf_non_ea_interval_mass64 field is a signed raw-CDF difference
+statistic, not an empirical sampling probability when rounding dips occur.
+Its bounded signed roundoff is recorded; actual EA/RL validity is enforced by
+the reconstructed learner indices and unchanged runtime origin checks.
+
 The short budget keeps the formal one-million Replay capacity, population,
 networks, batch and scoring parameters. Seed 1, Swimmer horizon 1000, warmup 10
 and 12 training generations give 320 initial plus 396 training episodes (716

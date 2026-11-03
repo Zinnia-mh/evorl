@@ -27,9 +27,18 @@ def validate_ess_evidence(row):
     if not math.isclose(row['effective_source_count_audit64'],n*fraction,rel_tol=1e-12,abs_tol=1e-12):raise ValueError('ESS count mismatch')
     if n:
         if abs(mass-1)>1e-5 or abs(row['transition_probability_mass64']-1)>1e-5 or squares<=0:raise ValueError('ESS mass mismatch')
-        if not math.isclose(fraction,mass*mass/(n*squares),rel_tol=1e-12,abs_tol=1e-12) or row['cdf_sampling_mass64']!=1:raise ValueError('ESS reference mismatch')
+        if not math.isclose(fraction,mass*mass/(n*squares),rel_tol=1e-12,abs_tol=1e-12):raise ValueError('ESS reference mismatch')
+        if row.get('cdf_in_training_sampling',True) and row['cdf_sampling_mass64']!=1:raise ValueError('CDF mass mismatch')
     elif any(row[k]!=0 for k in ['ess_fraction','source_probability_mass64','source_probability_squared_mass64','transition_probability_mass64','cdf_sampling_mass64']):raise ValueError('invalid empty ESS')
-    if row['cdf_probability_max_abs_error']<0 or not 0<=row['cdf_non_ea_interval_mass64']<=1:raise ValueError('invalid CDF evidence')
+    if row['cdf_probability_max_abs_error']<0:raise ValueError('invalid CDF evidence')
+    if row.get('cdf_in_training_sampling',True):
+        if 'cdf_valid_for_sampling' in row and row['cdf_valid_for_sampling'] is not True:raise ValueError('invalid active sampling CDF')
+        bound=row.get('cdf_accumulation_error_bound',0.)
+        if not 0<=bound<=1e-5:raise ValueError('invalid CDF error bound')
+        if row.get('cdf_max_abs_reference_error',0.)>bound:raise ValueError('CDF reference mismatch')
+        # Signed raw-CDF interval differences are not empirical probabilities.
+        allowance=2*bound*row.get('cdf_negative_delta_count',0)
+        if not -allowance<=row['cdf_non_ea_interval_mass64']<=1+allowance:raise ValueError('invalid CDF interval evidence')
 def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 def write(path,value):
     with Path(path).open('x') as f:json.dump(value,f,sort_keys=True,allow_nan=False,indent=2)
@@ -122,6 +131,7 @@ def validate_reports(reports,*,require_all=True):
         if [r['generation'] for r in rows]!=list(range(11,23)):raise ValueError('missing generation audit')
         for r in rows:
             validate_ess_evidence(r)
+            if 'cdf_in_training_sampling' in r and r['cdf_in_training_sampling'] is not (a!='A' and bool(r.get('distribution_prepared',False))):raise ValueError('CDF actual-use scope mismatch')
             required=['observed_batches','ea_slots','rl_slots','changed_ea','rl_changed','origin_changed','finite','probability_l1','eligible_baseline_mass','ess_fraction','reference_fingerprints','freshness_probe_neutral','sampling_probe_seconds','actor_optimizer_steps','critic_optimizer_steps','baseline_draw_sha256','fresh_fraction','expired_fraction','unscored_fraction','baseline_prng_transition_verified','intervention_terminal_key_verified','sampling_observation']
             if any(k not in r for k in required):raise ValueError('missing sampling audit')
             if not r['finite'] or r['rl_changed'] or r['origin_changed'] or not r['freshness_probe_neutral']:raise ValueError('sampling invariant failure')
