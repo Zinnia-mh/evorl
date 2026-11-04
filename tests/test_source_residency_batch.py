@@ -5,14 +5,26 @@ import pytest
 from evorl.algorithms.erl.erl_td3.source_replay import (init_source_score_table,update_resident_counts,compute_source_eligibility,build_weighted_source_distribution,sample_weighted_ea_indices)
 from evorl.algorithms.erl.erl_td3.source_residency_batch import recount_resident_sources
 
+def incremental_reference_with_live_registry(table,tokens,mask):
+    """Seed actual known residency, then apply genuine new-source insertions.
+
+    Resetting ALL counts before the reference scan repeats the production bug:
+    a new token can reclaim a live identity not yet reached by that scan.
+    """
+    identities=np.asarray(table.source_token);values=np.asarray(tokens);active=np.asarray(mask,bool)
+    known=active&np.isin(values,identities[identities>=0])
+    resident=np.where(known,values,-1).astype(np.int32)
+    counts=np.array([np.count_nonzero(resident==token) if token>=0 else 0 for token in identities],np.int32)
+    initial=table._replace(resident_count=jnp.asarray(counts))
+    return update_resident_counts(initial,jnp.asarray(resident),jnp.arange(len(values),dtype=jnp.int32),tokens,mask)
+
 @pytest.mark.parametrize('seed',range(8))
-def test_batch_recount_exactly_matches_sequential_slot_reclamation(seed):
+def test_batch_recount_matches_incremental_reference_with_live_source_counts(seed):
     rng=np.random.default_rng(seed);capacity=64
     table=init_source_score_table(capacity)._replace(source_token=jnp.r_[jnp.arange(20,dtype=jnp.int32),jnp.full((44,),-1,jnp.int32)],raw_score=jnp.arange(capacity,dtype=jnp.float32),rank_normalized_score=jnp.arange(capacity,dtype=jnp.float32)/64,validity=jnp.ones(capacity,bool),measured_generation=jnp.ones(capacity,jnp.int32),version=jnp.zeros(capacity,jnp.int32),score_kind=jnp.ones(capacity,jnp.int8),current_version=jnp.int32(0))
     tokens=jnp.array(rng.integers(-1,32,size=capacity),jnp.int32)
     mask=jnp.array(rng.random(capacity)>.25)
-    reset=table._replace(resident_count=jnp.zeros(capacity,jnp.int32))
-    old=update_resident_counts(reset,jnp.full((capacity,),-1,jnp.int32),jnp.arange(capacity,dtype=jnp.int32),tokens,mask)
+    old=incremental_reference_with_live_registry(table,tokens,mask)
     new=recount_resident_sources(table,tokens,mask)
     for a,b in zip(jax.tree.leaves(old),jax.tree.leaves(new)):np.testing.assert_array_equal(a,b)
     for w in [3,10,30]:
@@ -41,7 +53,7 @@ def test_ring_overwrite_mixed_and_repeated_writes_match_actual_residency():
         state=rb.add(state,dict(value=jnp.arange(n,dtype=jnp.float32)),provenance,mask=jnp.arange(n)%5!=0)
         mask=(jnp.arange(16)<state.buffer_size)&(state.origin_type==0)
         actual=recount_resident_sources(table,state.source_token,mask)
-        expected=update_resident_counts(table._replace(resident_count=jnp.zeros(16,jnp.int32)),jnp.full(16,-1,jnp.int32),jnp.arange(16),state.source_token,mask)
+        expected=incremental_reference_with_live_registry(table,state.source_token,mask)
         for a,b in zip(jax.tree.leaves(actual),jax.tree.leaves(expected)):np.testing.assert_array_equal(a,b)
         ids=np.asarray(actual.table.source_token);counts=np.asarray(actual.table.resident_count)
         for token,count in zip(ids,counts):

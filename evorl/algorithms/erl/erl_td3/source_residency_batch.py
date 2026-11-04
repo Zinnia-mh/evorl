@@ -1,4 +1,4 @@
-"""Host-boundary full recount, preserving the sequential registry allocation.
+"""Host-boundary full recount, protecting every still-resident identity first.
 
 Only refresh uses this path. Incremental overwrite primitives remain unchanged.
 Grouping is O(C log C); registry lookup/allocation is O(S + U), not O(C*S).
@@ -21,6 +21,12 @@ def recount_resident_sources(table,tokens,mask):
     lookup={}
     for slot in np.flatnonzero(source>=0):lookup.setdefault(int(source[slot]),int(slot))
     counts=np.zeros(len(source),np.int32);cleared=np.zeros(len(source),bool);cursor=0
+    # Physical ring order can put newly written tokens before old, still-live
+    # identities. Establish their final counts before reclaiming ANY slot.
+    # A zero running count is not evidence that its source has left Replay.
+    for token,count in zip(unique,multiplicity):
+        slot=lookup.get(int(token))
+        if slot is not None:counts[slot]=int(count)
     for i in order:
         token=int(unique[i]);slot=lookup.get(token)
         if slot is None:
@@ -31,7 +37,7 @@ def recount_resident_sources(table,tokens,mask):
             slot=cursor;previous=int(source[slot])
             if lookup.get(previous)==slot:del lookup[previous]
             source[slot]=token;lookup[token]=slot;cleared[slot]=True
-        counts[slot]+=int(multiplicity[i])
+            counts[slot]=int(multiplicity[i])
     clear=jnp.asarray(cleared)
     replacements=dict(source_token=jnp.asarray(source),resident_count=jnp.asarray(counts))
     for field,empty in [('raw_score',0.),('rank_normalized_score',0.),('measured_generation',-1),('score_kind',0),('validity',False),('weighted_eligible',False),('version',-1)]:
