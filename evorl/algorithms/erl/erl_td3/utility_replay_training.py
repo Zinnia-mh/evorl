@@ -1,5 +1,5 @@
 """Durable Pilot host loop; training step/evaluate and their PRNG are unchanged."""
-import contextlib,csv,fcntl,hashlib,json,math,subprocess,traceback,uuid
+import contextlib,csv,fcntl,hashlib,json,math,subprocess,traceback,uuid,time
 from pathlib import Path
 import jax,numpy as np
 from omegaconf import OmegaConf
@@ -9,6 +9,15 @@ from .utility_replay_checkpoint import PilotCheckpointStore,config_contract,mech
 from .utility_replay_smoke_workflow import initialization_fingerprint
 
 WORKFLOW='evorl.algorithms.erl.erl_td3.erl_utility_replay.ERLUtilityReplayWorkflow'
+
+def _runner_components(config):
+    if config.workflow_cls == WORKFLOW:
+        return ERLUtilityReplayWorkflow, PilotCheckpointStore, validate_arm_manifest
+    from .utility_replay_d1_training import D1_WORKFLOW, D1TrainingWorkflow, validate_d1_manifest
+    from .utility_replay_d1 import D1CheckpointStore
+    if config.workflow_cls == D1_WORKFLOW:
+        return D1TrainingWorkflow, D1CheckpointStore, validate_d1_manifest
+    raise ValueError('unsupported durable workflow')
 
 def _write(path,data):
     with Path(path).open('x') as f:json.dump(data,f,sort_keys=True,indent=2,allow_nan=False,default=_json)
@@ -43,8 +52,10 @@ def _lock(directory):
 
 def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation=None,checkpoint_interval=50,keep=3):
     c=OmegaConf.create(OmegaConf.to_container(config,resolve=True));directory=Path(directory).resolve()
-    validate_arm_manifest(c)
-    if c.workflow_cls!=WORKFLOW or not c.save_replay_buffer or c.checkpoint.enable:raise ValueError('durable Pilot requires full replay and one runner-owned native checkpoint manager')
+    workflow_type,checkpoint_type,validator=_runner_components(c)
+    sealed=validator(c)
+    if c.workflow_cls!=WORKFLOW and dict(interval=checkpoint_interval,keep=keep)!=sealed['checkpoint_policy']:raise ValueError('D1 checkpoint policy differs from frozen manifest')
+    if not c.save_replay_buffer or c.checkpoint.enable:raise ValueError('durable Pilot requires full replay and one runner-owned native checkpoint manager')
     if checkpoint_interval<1 or keep<2:raise ValueError('checkpoint interval>=1 and keep>=2 required')
     c.output_dir=str(directory)
     if resume_checkpoint is None:
@@ -63,12 +74,12 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
         if (directory/'completion.json').exists():raise ValueError('run is already complete')
         segment=directory/'segments'/uuid.uuid4().hex;segment.mkdir(parents=True,exist_ok=False)
         _write(segment/'segment.json',dict(parent_checkpoint=str(resume_checkpoint) if resume_checkpoint else None,commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()))
-        workflow=type('CheckpointPilot',(ERLUtilityReplayWorkflow,),{}).build_from_config(c,enable_jit=bool(c.enable_jit))
+        workflow=type('CheckpointPilot',(workflow_type,),{}).build_from_config(c,enable_jit=bool(c.enable_jit))
         restored_hash=None;last_checkpoint=str(resume_checkpoint) if resume_checkpoint else None
         try:
             if resume_checkpoint:
                 template=restore_template(workflow)
-                with PilotCheckpointStore(resume_checkpoint.parent,c,read_only=True) as reader:state,runtime=reader.restore(int(resume_checkpoint.name),template)
+                with checkpoint_type(resume_checkpoint.parent,c,read_only=True) as reader:state,runtime=reader.restore(int(resume_checkpoint.name),template)
                 if runtime['run_id']!=manifest['run_id']:raise ValueError('checkpoint run identity mismatch')
                 workflow.recorder.init();restored_hash=initialization_fingerprint(state)
                 audit=_attach(workflow,runtime)
@@ -82,10 +93,15 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
             _validate_runtime(state,runtime,audit)
             target=int(runtime['target_generation']);stop=target if stop_after_generation is None else min(target,int(stop_after_generation))
             if stop<int(state.metrics.iterations):raise ValueError('stop generation precedes restored state')
-            with PilotCheckpointStore(segment/'checkpoints',c,interval=checkpoint_interval,keep=keep) as store,(segment/'events.jsonl').open('x') as events:
+            checkpoint_directory=resume_checkpoint.parent if c.workflow_cls!=WORKFLOW and resume_checkpoint else segment/'checkpoints'
+            requested_stop=False
+            with checkpoint_type(checkpoint_directory,c,interval=checkpoint_interval,keep=keep) as store,(segment/'events.jsonl').open('x') as events:
                 if resume_checkpoint is None:last_checkpoint=str(store.save(state,runtime,force=True))
                 for generation in range(int(state.metrics.iterations)+1,stop+1):
+                    before=state;step_started=time.perf_counter()
                     metrics,state=workflow.step(state);jax.block_until_ready((metrics,state))
+                    observer=getattr(workflow,'observe_training_step',None)
+                    if observer is not None:observer(before,metrics,state,segment,time.perf_counter()-step_started)
                     events.write(json.dumps(dict(type='train',**_counters(state),metrics=metrics.to_local_dict()),default=_json,allow_nan=False)+'\n');events.flush()
                     if generation%int(c.eval_interval)==0 or generation==target:
                         evaluation,state=workflow.evaluate(state);jax.block_until_ready((evaluation,state))
@@ -95,8 +111,11 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
                         runtime['evaluations'].append(row)
                         events.write(json.dumps(dict(type='evaluation',**row),allow_nan=False)+'\n');events.flush()
                     runtime['budget']=_budget(audit);_validate_runtime(state,runtime,audit)
-                    saved=store.save(state,runtime,force=generation in [stop,target])
+                    stop_hook=getattr(workflow,'stop_requested',None)
+                    requested_stop=bool(stop_hook(directory,manifest['run_id'])) if stop_hook else False
+                    saved=store.save(state,runtime,force=generation in [stop,target] or requested_stop)
                     if saved:last_checkpoint=str(saved)
+                    if requested_stop:break
                 done=int(state.metrics.iterations)==target
                 budget=audit.finalize(final_episodes=int(state.metrics.sampled_episodes),final_iteration=int(state.metrics.iterations),final_timesteps=int(state.metrics.sampled_timesteps)) if done else None
                 rows=runtime['evaluations'];auc=sum(.5*(a['return_mean']+b['return_mean'])*(b['environment_timesteps']-a['environment_timesteps']) for a,b in zip(rows,rows[1:])) if len(rows)>1 else None
@@ -104,6 +123,7 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
                 with (segment/'evaluations.csv').open('x',newline='') as stream:
                     writer=csv.DictWriter(stream,fieldnames=list(rows[0]) if rows else ['generation','environment_timesteps','return_mean']);writer.writeheader();writer.writerows(rows)
                 _write(segment/'report.json',report)
+                if requested_stop:workflow.acknowledge_stop(directory,segment)
                 if done:_write(directory/'completion.json',dict(segment=str(segment),checkpoint=last_checkpoint,report_sha256=hashlib.sha256((segment/'report.json').read_bytes()).hexdigest()))
                 return state,report
         except Exception:
