@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - /agent/erl/erl-utility-replay
+workflow_cls: evorl.algorithms.erl.erl_td3.utility_replay_d1.ERLUtilityReplayD1Workflow
+utility_variant: d1-v1
+arm: utility
+score_kind: utility
+alpha: 0.3
+rho: 0.3
+half_life: 15.0
+priority_cap: 0.1
+utility_scale: 0.01
+freshness_window: 30
+min_resident: 4
+diagnostic_enabled: true
+diagnostic_interval: 1
+replay_temperature: 0.5
+seed: 2027
