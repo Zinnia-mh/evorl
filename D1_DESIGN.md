@@ -54,7 +54,7 @@ all existing learner/replay/optimizer/PRNG fields. Old scores are not recomputed
 on resume. The explicit D1 checkpoint wrapper additionally rejects missing/wrong
 variant config. D0 remains restorable only with its own fixed code/config.
 
-Architecture: subclass the D0 workflow, force diagnostic_interval1 for active
+Historical D1-v1 architecture (superseded by D1-2 below): subclass the D0 workflow, force diagnostic_interval1 for active
 D1, reuse its pre-add diagnostic/insertion and JIT TD3 cores. Replace installed
 new-source priority values immediately after pre-add scoring/insertion returns,
 before any learner update. Override _weighted_rl_update to build the D1
@@ -109,3 +109,65 @@ Artifacts: `/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/d1/
 The first config-only probe failed on a Hydra inheritance path before any
 rollout; a test-helper import path was also corrected. No probability, index,
 age, real residency or checkpoint invariant failed. Earlier logs are retained.
+
+## D1-2 single-distribution refresh
+
+The D1 Host step now mirrors the frozen parent step with exactly one AST
+substitution: its refresh call uses the D1-only refresh method. The existing
+EA rollout, pre-exposure diagnostic, RL rollout, key split, update counts,
+injection and returned state order are unchanged. An AST regression enforces
+this structural correspondence. The D0 parent and all ABC paths are untouched.
+
+D1-only d1_residency.recount_and_map preserves the original Ring recount's
+allocation order, error status and score invalidation. The existing np.unique
+also returns its inverse; final transition-to-source slots are returned with
+resident counts. This avoids a second full-Replay mapping and GPU source-table
+sort. Recount grouping remains O(C log C), registry work O(S+U), and the final
+device distribution/CDF is O(C+S). The standalone calculator has a compact Host
+mapping fallback; the actual workflow passes the mapping from its single recount.
+
+The previous discarded D0 refresh and the second D0 alpha-zero baseline build
+inside D1 are both absent. Baseline probabilities/counts are computed directly
+with the original float32 operations. D1 constructs exactly one final source
+probability, transition probability and CDF before calling unchanged TD3.
+The formula, precision, cap, age window and checkpoint schema remain unchanged.
+The probe now labels actual D1 refresh separately from discarded D0 cost (zero).
+
+Verification artifacts (outside Git):
+- phase-d1-2-v1-seed2027: real formal-network GPU JIT, two post-warmup steps;
+  32 true pre-exposure scores per step, unchanged TD3 update rate, seed2027.
+  The first learner update is also run through frozen 9441b98 code on identical
+  inputs; all resulting state/optimizer/metric leaves are bitwise equal.
+  Full checkpoint roundtrip followed by the second real step passes.
+- phase-d1-2-v2-scale-only-seed2027: corrected well-formed synthetic score_kind
+  and eligibility metadata; 1m capacity/table, 1024 sources, mixed ages0..31,
+  complete age sweep and old/new exact sampled indices/keys. The initial v1
+  synthetic fixture omitted score_kind, so use v2 for eligibility evidence.
+  The v1 real diagnostics installed actual Utility score_kind and are unaffected.
+
+35 targeted tests cover original23 D1 tests, original7 Ring tests and5 new
+optimization tests. Frozen D0/shared modules and frozen formal files are checked
+unchanged. No formal seeds, Return-based selection or long development run.
+The short real probe uses formal256x256 networks/pop32/1m Replay/batch256,
+but one warmup and256-step episodes to bound interactions. It is not a training
+performance comparison. Reconstructed sampler indices are labeled as such;
+terminal key and Actor/Critic counts are checked against actual TD3 execution.
+
+Initial measurement: original D1 builder warm~3.535s, optimized~.721s on the
+same full synthetic Replay; discarded D0~2.08s per previous preflight is removed.
+Combined mapping/recount~.027s. First compile/execution is reported separately.
+The second real short generation is84.09s: diagnostic19.91s, source.249s,
+D1 refresh3.329s, learner11.459s; two real steps do not establish steady long-run
+throughput. GPU live peak~.961GiB, JAX pool~17.73GiB, process peakRSS~5.55GiB,
+including old-reference validation/compilation. No long run is launched here.
+
+Final-byte checkpoint validation: normalization from CRLF to LF changes the
+existing all-implementation digest, so the supplementary cross-version load
+correctly rejected the earlier probe checkpoint. The archived metadata digest
+was reproduced exactly by read-only CRLF substitution of the two changed source
+files, with config/environment contracts equal. No guard was bypassed. A new
+formal-shaped synthetic full-state checkpoint under final LF code restores
+bitwise exactly (phase-d1-2-v3-final-bytes-checkpoint). The original same-version
+real resume evidence remains valid for its archived implementation bytes; it
+is not advertised as cross-version compatible. Fresh-process formal-shaped
+sampler compilation plus first draw is1.444s; five warm draws average1.068ms.
