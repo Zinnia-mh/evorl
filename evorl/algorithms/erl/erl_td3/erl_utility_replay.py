@@ -242,6 +242,7 @@ def refresh_replay_distribution(
     alpha: float,
     replay_temperature: float,
     timing_sink: dict | None = None,
+    rank_transform=None,
 ) -> UtilityReplayState:
     """Refresh residency, eligibility and distribution after all insertions."""
     capacity = replay_buffer_state.origin_type.shape[0]
@@ -272,8 +273,11 @@ def refresh_replay_distribution(
             time.perf_counter() - eligibility_start
         )
     distribution_start = time.perf_counter()
+    distribution_table = eligibility.table
+    if rank_transform is not None:
+        distribution_table = rank_transform(distribution_table)
     distribution = build_weighted_source_distribution(
-        eligibility.table,
+        distribution_table,
         resident_source_tokens=recounted.resident_source_tokens,
         resident_mask=resident_ea,
         alpha=alpha,
@@ -733,6 +737,7 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
             alpha=float(self.config.alpha),
             replay_temperature=float(self.config.replay_temperature),
             timing_sink=self._latest_score_lifecycle_audit,
+            rank_transform=getattr(self, "_ablation_rank_transform", None),
         )
         self._active_utility_replay_state = utility_replay_state
         self._latest_score_lifecycle_audit["resident_and_refresh_seconds"] = (

@@ -41,7 +41,7 @@ def _lock(directory):
         try:yield
         finally:fcntl.flock(stream,fcntl.LOCK_UN)
 
-def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation=None,checkpoint_interval=50,keep=3):
+def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation=None,checkpoint_interval=50,keep=3,ablation=None):
     c=OmegaConf.create(OmegaConf.to_container(config,resolve=True));directory=Path(directory).resolve()
     validate_arm_manifest(c)
     if c.workflow_cls!=WORKFLOW or not c.save_replay_buffer or c.checkpoint.enable:raise ValueError('durable Pilot requires full replay and one runner-owned native checkpoint manager')
@@ -50,6 +50,8 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
     if resume_checkpoint is None:
         directory.mkdir(parents=True,exist_ok=False)
         manifest=dict(schema=1,run_id=uuid.uuid4().hex,config_contract=config_contract(c),mechanism_digest=mechanism_digest(),commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),checkpoint_policy=dict(interval=checkpoint_interval,keep=keep,manager='native Orbax Composite(state,runtime)'),logging='append-only segments; full canonical evaluation prefix per segment')
+        if ablation is not None:
+            manifest['ablation'] = ablation.identity
         OmegaConf.save(c,directory/'resolved_config.yaml',resolve=True)
         manifest['resolved_config_sha256']=hashlib.sha256((directory/'resolved_config.yaml').read_bytes()).hexdigest()
         _write(directory/'manifest.json',manifest)
@@ -57,13 +59,20 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
         if (directory/'completion.json').exists():raise ValueError('run is already complete')
         manifest=json.loads((directory/'manifest.json').read_text())
         if hashlib.sha256((directory/'resolved_config.yaml').read_bytes()).hexdigest()!=manifest['resolved_config_sha256'] or config_contract(c)!=manifest['config_contract'] or mechanism_digest()!=manifest['mechanism_digest']:raise ValueError('incompatible resume configuration or code')
+        if manifest.get('ablation') != (ablation.identity if ablation is not None else None):
+            raise ValueError('incompatible resume ablation identity')
+        if ablation is not None and manifest['checkpoint_policy'] != dict(interval=checkpoint_interval,keep=keep,manager='native Orbax Composite(state,runtime)'):
+            raise ValueError('incompatible ablation checkpoint policy')
         resume_checkpoint=Path(resume_checkpoint).resolve()
         if not resume_checkpoint.is_relative_to(directory/'segments'):raise ValueError('checkpoint belongs to another run directory')
     with _lock(directory):
         if (directory/'completion.json').exists():raise ValueError('run is already complete')
         segment=directory/'segments'/uuid.uuid4().hex;segment.mkdir(parents=True,exist_ok=False)
         _write(segment/'segment.json',dict(parent_checkpoint=str(resume_checkpoint) if resume_checkpoint else None,commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()))
-        workflow=type('CheckpointPilot',(ERLUtilityReplayWorkflow,),{}).build_from_config(c,enable_jit=bool(c.enable_jit))
+        workflow_type = ERLUtilityReplayWorkflow if ablation is None else ablation.workflow_type
+        workflow=type('CheckpointPilot',(workflow_type,),{}).build_from_config(c,enable_jit=bool(c.enable_jit))
+        if ablation is not None:
+            ablation.configure(workflow, segment)
         restored_hash=None;last_checkpoint=str(resume_checkpoint) if resume_checkpoint else None
         try:
             if resume_checkpoint:
@@ -85,18 +94,28 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
             with PilotCheckpointStore(segment/'checkpoints',c,interval=checkpoint_interval,keep=keep) as store,(segment/'events.jsonl').open('x') as events:
                 if resume_checkpoint is None:last_checkpoint=str(store.save(state,runtime,force=True))
                 for generation in range(int(state.metrics.iterations)+1,stop+1):
+                    if ablation is not None:
+                        ablation.before_generation(state)
                     metrics,state=workflow.step(state);jax.block_until_ready((metrics,state))
-                    events.write(json.dumps(dict(type='train',**_counters(state),metrics=metrics.to_local_dict()),default=_json,allow_nan=False)+'\n');events.flush()
+                    if ablation is None:
+                        events.write(json.dumps(dict(type='train',**_counters(state),metrics=metrics.to_local_dict()),default=_json,allow_nan=False)+'\n');events.flush()
                     if generation%int(c.eval_interval)==0 or generation==target:
                         evaluation,state=workflow.evaluate(state);jax.block_until_ready((evaluation,state))
                         returns=np.asarray(evaluation.rl_episode_returns)
                         if not np.all(np.isfinite(returns)):raise ValueError('nonfinite evaluation return')
                         row=dict(generation=generation,environment_timesteps=int(state.metrics.sampled_timesteps),environment_episodes=int(state.metrics.sampled_episodes),return_mean=float(returns.mean()),return_mean_by_rl_agent=returns.tolist(),mean_episode_lengths=np.asarray(evaluation.rl_episode_lengths).tolist())
                         runtime['evaluations'].append(row)
-                        events.write(json.dumps(dict(type='evaluation',**row),allow_nan=False)+'\n');events.flush()
+                        if ablation is None:
+                            events.write(json.dumps(dict(type='evaluation',**row),allow_nan=False)+'\n');events.flush()
                     runtime['budget']=_budget(audit);_validate_runtime(state,runtime,audit)
                     saved=store.save(state,runtime,force=generation in [stop,target])
                     if saved:last_checkpoint=str(saved)
+                    if ablation is not None:
+                        ablation.record(workflow, state, last_checkpoint, runtime)
+                        events.write(json.dumps(dict(type='train',**_counters(state),metrics=metrics.to_local_dict()),default=_json,allow_nan=False)+'\n')
+                        if runtime['evaluations'] and runtime['evaluations'][-1]['generation'] == generation:
+                            events.write(json.dumps(dict(type='evaluation',**runtime['evaluations'][-1]),allow_nan=False)+'\n')
+                        events.flush()
                 done=int(state.metrics.iterations)==target
                 budget=audit.finalize(final_episodes=int(state.metrics.sampled_episodes),final_iteration=int(state.metrics.iterations),final_timesteps=int(state.metrics.sampled_timesteps)) if done else None
                 rows=runtime['evaluations'];auc=sum(.5*(a['return_mean']+b['return_mean'])*(b['environment_timesteps']-a['environment_timesteps']) for a,b in zip(rows,rows[1:])) if len(rows)>1 else None
