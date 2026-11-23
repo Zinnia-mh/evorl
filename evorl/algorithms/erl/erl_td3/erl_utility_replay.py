@@ -583,6 +583,7 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
                     _,
                     utility_replay_state,
                 ) = carry
+                input_key = key
                 key, rb_key, learn_key = jax.random.split(key, 3)
                 num_draws = (
                     config.actor_update_interval * config.num_rl_agents
@@ -625,7 +626,9 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
                     replay_buffer_state,
                     td3_metrics,
                     sampled.utility_replay_state,
-                ), None
+                ), workflow._learner_trace(
+                    sampled, input_key, learn_key, utility_replay_state.intervention_key
+                )
 
             if is_jitted(cls._evaluate_with_count):
                 _weighted_rl_sample_and_update_fn = jax.jit(
@@ -643,6 +646,12 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
     def _observe_weighted_replay_draws(self, sampled, replay_buffer_state):
         """No-op seam; only the isolated Smoke subclass records actual draws."""
         del sampled, replay_buffer_state
+
+    def _learner_trace(self, sampled, learner_key, update_key, intervention_key):
+        return None
+
+    def _capture_learner_trace(self, trace):
+        pass
 
     def _with_generation_context(self, state, operation):
         self._provenance_generation = self._generation_from_state(state)
@@ -672,7 +681,7 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
                 td3_metrics,
                 utility_replay_state,
             ),
-            _,
+            trace,
         ) = jax.lax.scan(
             self._rl_sample_and_update_fn,
             (
@@ -686,6 +695,7 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
             (),
             length=num_updates,
         )
+        self._capture_learner_trace(trace)
         return td3_metrics, agent_state, opt_state, utility_replay_state
 
     def _weighted_step(self, state):

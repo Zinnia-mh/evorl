@@ -81,6 +81,7 @@ class ObservedD0(ERLUtilityReplayWorkflow):
 
 class Ablation:
     workflow_type = ObservedD0
+    reconstruct_sample_evidence = True
 
     def __init__(self, arm, seed, plan_sha256):
         if arm not in ('A', 'D0', 'P'):
@@ -155,7 +156,7 @@ class Ablation:
                        ess_fraction=float(p64.sum()**2 / (np.dot(p64, p64)*n)) if n else 0.,
                        eligible_mass=float(dist.eligible_baseline_mass),
                        eligible_sources=int(dist.eligible_source_count))
-        if g in (20, 31, 60, 120):
+        if self.reconstruct_sample_evidence and g in (20, 31, 60, 120):
             trace = jax.device_get(reconstruct_replay_draws(
                 replay, key, utility, num_updates=32, num_draws=2,
                 batch_size=256, uniform=self.arm == 'A',

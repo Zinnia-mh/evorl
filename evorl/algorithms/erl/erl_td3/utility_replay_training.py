@@ -41,12 +41,14 @@ def _lock(directory):
         try:yield
         finally:fcntl.flock(stream,fcntl.LOCK_UN)
 
-def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation=None,checkpoint_interval=50,keep=3,ablation=None):
+def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation=None,checkpoint_interval=50,keep=3,ablation=None,fork=False):
     c=OmegaConf.create(OmegaConf.to_container(config,resolve=True));directory=Path(directory).resolve()
     validate_arm_manifest(c)
     if c.workflow_cls!=WORKFLOW or not c.save_replay_buffer or c.checkpoint.enable:raise ValueError('durable Pilot requires full replay and one runner-owned native checkpoint manager')
     if checkpoint_interval<1 or keep<2:raise ValueError('checkpoint interval>=1 and keep>=2 required')
     c.output_dir=str(directory)
+    if fork and (resume_checkpoint is not None or ablation is None or not hasattr(ablation,'fork_state')):
+        raise ValueError('fork requires a shared parent and a new run')
     if resume_checkpoint is None:
         directory.mkdir(parents=True,exist_ok=False)
         manifest=dict(schema=1,run_id=uuid.uuid4().hex,config_contract=config_contract(c),mechanism_digest=mechanism_digest(),commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),checkpoint_policy=dict(interval=checkpoint_interval,keep=keep,manager='native Orbax Composite(state,runtime)'),logging='append-only segments; full canonical evaluation prefix per segment')
@@ -68,7 +70,7 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
     with _lock(directory):
         if (directory/'completion.json').exists():raise ValueError('run is already complete')
         segment=directory/'segments'/uuid.uuid4().hex;segment.mkdir(parents=True,exist_ok=False)
-        _write(segment/'segment.json',dict(parent_checkpoint=str(resume_checkpoint) if resume_checkpoint else None,commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()))
+        _write(segment/'segment.json',dict(parent_checkpoint=str(resume_checkpoint) if resume_checkpoint else (str(ablation.parent) if fork else None),commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()))
         workflow_type = ERLUtilityReplayWorkflow if ablation is None else ablation.workflow_type
         workflow=type('CheckpointPilot',(workflow_type,),{}).build_from_config(c,enable_jit=bool(c.enable_jit))
         if ablation is not None:
@@ -79,6 +81,12 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
                 template=restore_template(workflow)
                 with PilotCheckpointStore(resume_checkpoint.parent,c,read_only=True) as reader:state,runtime=reader.restore(int(resume_checkpoint.name),template)
                 if runtime['run_id']!=manifest['run_id']:raise ValueError('checkpoint run identity mismatch')
+                if ablation is not None and hasattr(ablation,'validate_resume'):
+                    ablation.validate_resume(resume_checkpoint,state)
+                workflow.recorder.init();restored_hash=initialization_fingerprint(state)
+                audit=_attach(workflow,runtime)
+            elif fork:
+                state,runtime=ablation.fork_state(workflow,manifest['run_id'])
                 workflow.recorder.init();restored_hash=initialization_fingerprint(state)
                 audit=_attach(workflow,runtime)
             else:
@@ -92,7 +100,7 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
             target=int(runtime['target_generation']);stop=target if stop_after_generation is None else min(target,int(stop_after_generation))
             if stop<int(state.metrics.iterations):raise ValueError('stop generation precedes restored state')
             with PilotCheckpointStore(segment/'checkpoints',c,interval=checkpoint_interval,keep=keep) as store,(segment/'events.jsonl').open('x') as events:
-                if resume_checkpoint is None:last_checkpoint=str(store.save(state,runtime,force=True))
+                if resume_checkpoint is None and not fork:last_checkpoint=str(store.save(state,runtime,force=True))
                 for generation in range(int(state.metrics.iterations)+1,stop+1):
                     if ablation is not None:
                         ablation.before_generation(state)
@@ -108,10 +116,14 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
                         if ablation is None:
                             events.write(json.dumps(dict(type='evaluation',**row),allow_nan=False)+'\n');events.flush()
                     runtime['budget']=_budget(audit);_validate_runtime(state,runtime,audit)
+                    audited=ablation is not None and getattr(ablation,'audit_before_checkpoint',False)
+                    if audited:
+                        ablation.record(workflow,state,str(store.directory/str(generation)),runtime)
                     saved=store.save(state,runtime,force=generation in [stop,target])
                     if saved:last_checkpoint=str(saved)
                     if ablation is not None:
-                        ablation.record(workflow, state, last_checkpoint, runtime)
+                        if not audited:
+                            ablation.record(workflow, state, last_checkpoint, runtime)
                         events.write(json.dumps(dict(type='train',**_counters(state),metrics=metrics.to_local_dict()),default=_json,allow_nan=False)+'\n')
                         if runtime['evaluations'] and runtime['evaluations'][-1]['generation'] == generation:
                             events.write(json.dumps(dict(type='evaluation',**runtime['evaluations'][-1]),allow_nan=False)+'\n')
