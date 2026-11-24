@@ -1250,3 +1250,84 @@ def test_pilot_identity_opt_in_preserves_real_replay_full_step(monkeypatch, pilo
     chex.assert_trees_all_equal(off_metrics, on_metrics)
     assert off.ec_collector.calls == on.ec_collector.calls == 1
     assert off.rl_collector.calls == on.rl_collector.calls == 1
+
+
+def test_derived_sources_use_current_actor_and_do_not_touch_baseline():
+    class Collector:
+        def rollout(self, state, key, episodes):
+            del key, episodes
+            weight = state.params.actor_params["w"]
+            trajectory = SampleBatch(
+                obs=jnp.ones((3, 1, 1)),
+                actions=jnp.ones((3, 1, 1)) * weight,
+                rewards=jnp.ones((3, 1)) * weight,
+                dones=jnp.zeros((3, 1), dtype=jnp.bool_),
+            )
+            return PyTreeDict(
+                episode_returns=jnp.reshape(weight, (1,)),
+                episode_lengths=jnp.array([3]),
+            ), trajectory
+
+    workflow = object.__new__(ERLUtilitySourceControlsWorkflow)
+    workflow.config = SimpleNamespace(
+        derived_enabled=True, derived_small_strength=0.01,
+        derived_large_strength=0.1, source_batch_size=2,
+        episodes_for_fitness=1,
+    )
+    workflow.ec_collector = Collector()
+    workflow.agent_state_vmap_axes = AgentState(params=0, obs_preprocessor_state=None)
+    workflow.agent = SimpleNamespace(
+        normalize_obs=False,
+        actor_network=SimpleNamespace(apply=lambda params, obs: params["w"] * obs),
+    )
+    params = TD3NetworkParams(
+        actor_params={"w": jnp.array([[2.0]])},
+        target_actor_params={"w": jnp.array([[2.0]])},
+        critic_params=None, target_critic_params=None,
+    )
+    state = AgentState(params=params)
+    context = SimpleNamespace(key=jax.random.key(9), generation=20)
+    before = tree_fingerprint(state)
+    key_before = tree_fingerprint(context.key)
+    workflow._stage_derived_sources(state, context)
+    assert [source.source_type for source in context.derived_sources] == [
+        "RL-derived-small", "RL-derived-large"
+    ]
+    assert all(source.eligible and source.batch is not None for source in context.derived_sources)
+    assert all(source.valid_transition_count >= 2 for source in context.derived_sources)
+    assert context.derived_timesteps == 6
+    assert all(value > 0 for value in context.derived_behavior_distances.values())
+    assert tree_fingerprint(state) == before
+    assert tree_fingerprint(context.key) == key_before
+    first = [(source.source_id, tree_fingerprint(source.batch)) for source in context.derived_sources]
+    workflow._stage_derived_sources(state, context)
+    assert first == [(source.source_id, tree_fingerprint(source.batch)) for source in context.derived_sources]
+
+
+def test_derived_sources_disabled_has_zero_interactions():
+    workflow = object.__new__(ERLUtilitySourceControlsWorkflow)
+    workflow.config = SimpleNamespace(derived_enabled=False)
+    context = SimpleNamespace()
+    workflow._stage_derived_sources(None, context)
+    assert context.derived_sources == ()
+    assert context.derived_timesteps == 0
+
+
+def test_derived_batch_uses_existing_frozen_utility_matrix():
+    workflow, context, rl_source, replay_state = _deferred_workflow_and_context()
+    context.derived_sources = (
+        SourceControlBatch(
+            "RL-derived-small", "derived-small",
+            SampleBatch(obs=jnp.full((2, 1), 1.2)),
+        ),
+    )
+    diagnostic = workflow._run_deferred_source_control_diagnostic(
+        context, rl_source, replay_state
+    )
+    assert diagnostic.valid
+    assert len(diagnostic.records) == 72
+    derived = [record for record in diagnostic.records
+               if record.source_type == "RL-derived-small"]
+    assert len(derived) == 12
+    assert all(record.td_error_mean is not None for record in derived)
+    assert all(record.utility is not None for record in derived)

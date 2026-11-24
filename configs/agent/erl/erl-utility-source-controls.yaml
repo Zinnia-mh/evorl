@@ -4,6 +4,9 @@ workflow_cls: evorl.algorithms.erl.erl_td3.erl_utility_source_controls.ERLUtilit
 
 # Read-only source-control diagnostic. Disabled preserves Original ERL behavior.
 diagnostic_enabled: false
+derived_enabled: false
+derived_small_strength: 0.005
+derived_large_strength: 0.05
 reference_target_bias_enabled: false
 diagnostic_interval: 10
 artifact_root: null

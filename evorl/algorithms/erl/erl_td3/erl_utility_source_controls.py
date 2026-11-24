@@ -13,9 +13,11 @@ import sys
 import uuid
 
 import jax
+import jax.numpy as jnp
 import jax.tree_util as jtu
 
 from .erl_learner_utility import ERLLearnerUtilityWorkflow
+from .erl_td3_workflow import erl_replace_td3_actor_params
 from .learner_utility import (
     build_source_batches,
     derive_diagnostic_key,
@@ -50,6 +52,7 @@ SOURCE_CONTROL_REFERENCE_TAG = 0x53435246
 SOURCE_CONTROL_REPLAY_RANDOM_TAG = 0x53435252
 SOURCE_CONTROL_EA_TAG = 0x53434541
 SOURCE_CONTROL_RL_OWN_TAG = 0x5343524C
+SOURCE_CONTROL_DERIVED_TAG = 0x53434452
 SOURCE_CONTROL_ALLOWED_ARTIFACT_ROOT = Path(
     "/disk1/zmh_projects/evorl_utility_source_controls_outputs"
 )
@@ -548,6 +551,49 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
         )
         return ()
 
+    def _stage_derived_sources(self, agent_state, context):
+        if not bool(getattr(self.config, "derived_enabled", False)):
+            context.derived_sources, context.derived_timesteps = (), 0
+            return
+        actor = jtu.tree_map(lambda x: x[0], agent_state.params.actor_params)
+        root = derive_diagnostic_key(context.key, context.generation, SOURCE_CONTROL_DERIVED_TAG)
+        sources, steps = [], 0
+        distances = {}
+        for i, (name, strength) in enumerate((
+            ("RL-derived-small", float(self.config.derived_small_strength)),
+            ("RL-derived-large", float(self.config.derived_large_strength)),
+        )):
+            mutation_key, rollout_key, sample_key = jax.random.split(jax.random.fold_in(root, i), 3)
+            leaves, treedef = jtu.tree_flatten(actor)
+            keys = jax.random.split(mutation_key, len(leaves))
+            mutated = jtu.tree_unflatten(treedef, [
+                x + strength * jax.random.normal(k, x.shape, x.dtype)
+                for x, k in zip(leaves, keys)
+            ])
+            batched = jtu.tree_map(lambda x: jnp.expand_dims(x, 0), mutated)
+            derived_state = erl_replace_td3_actor_params(agent_state, batched)
+            metrics, trajectory = jax.vmap(
+                self.ec_collector.rollout, in_axes=(self.agent_state_vmap_axes, 0, None)
+            )(derived_state, jax.random.split(rollout_key, 1), self.config.episodes_for_fitness)
+            obs = trajectory.obs.reshape((-1, *trajectory.obs.shape[3:]))
+            if self.agent.normalize_obs:
+                obs = self.agent.obs_preprocessor(obs, agent_state.obs_preprocessor_state)
+            base_actions = self.agent.actor_network.apply(actor, obs)
+            derived_actions = self.agent.actor_network.apply(mutated, obs)
+            distances[name] = float(jax.device_get(
+                jnp.mean(jnp.linalg.norm(derived_actions - base_actions, axis=-1))
+            ))
+            batch = build_rl_own_source_batch(
+                trajectory, generation=context.generation,
+                source_batch_size=int(self.config.source_batch_size), key=sample_key
+            )
+            sources.append(replace(batch, source_type=name,
+                source_id=f"gen_{context.generation}_{name.lower()}",
+                evolutionary_fitness=float(jax.device_get(metrics.episode_returns.mean()))))
+            steps += int(jax.device_get(metrics.episode_lengths.sum()))
+        context.derived_sources, context.derived_timesteps = tuple(sources), steps
+        context.derived_behavior_distances = distances
+
     def _run_deferred_source_control_diagnostic(
         self, context, rl_source, replay_after_rl
     ):
@@ -560,6 +606,9 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             "replay_metadata_fingerprint": snapshot.replay_metadata_fingerprint,
             "temporal_alignment": context.source_temporal_alignment,
         }
+        if bool(getattr(self.config, "derived_enabled", False)):
+            self._latest_source_control_provenance["derived_extra_timesteps"] = int(getattr(context, "derived_timesteps", 0))
+            self._latest_source_control_provenance["derived_behavior_distances"] = dict(getattr(context, "derived_behavior_distances", {}))
         if not context.controls_eligible:
             diagnostic = CheckpointDiagnostic.from_records(
                 checkpoint=context.generation,
@@ -598,7 +647,7 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             for index, batch in enumerate(snapshot.replay_control_batches)
         )
         ordinary_sources = (
-            tuple(context.ea_sources) + (rl_source,) + replay_sources
+            tuple(context.ea_sources) + (rl_source,) + tuple(getattr(context, 'derived_sources', ())) + replay_sources
         )
         update_key = derive_source_update_key(
             snapshot.baseline_key, snapshot.generation
@@ -699,6 +748,7 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
             == context.snapshot.critic_fingerprint
             else "delayed"
         )
+        self._stage_derived_sources(agent_state, context)
         self._run_deferred_source_control_diagnostic(
             context,
             context.rl_source,
