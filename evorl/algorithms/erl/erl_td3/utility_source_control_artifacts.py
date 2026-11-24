@@ -105,7 +105,7 @@ REFERENCE_STABILITY_HEADER = (
     "all_near_zero",
 )
 SOURCE_ORDER = {
-    v: i for i, v in enumerate(("EA", "RL-own", "Replay-random", "Reference-self"))
+    v: i for i, v in enumerate(("EA", "RL-own", "RL-unmutated-EC", "RL-derived-small", "RL-derived-large", "Replay-random", "Reference-self"))
 }
 
 

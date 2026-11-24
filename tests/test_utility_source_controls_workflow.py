@@ -1255,10 +1255,11 @@ def test_pilot_identity_opt_in_preserves_real_replay_full_step(monkeypatch, pilo
 def test_derived_sources_use_current_actor_and_do_not_touch_baseline():
     class Collector:
         def rollout(self, state, key, episodes):
-            del key, episodes
+            del episodes
             weight = state.params.actor_params["w"]
+            initial_obs = 1.0 + jax.random.uniform(key, ())
             trajectory = SampleBatch(
-                obs=jnp.ones((3, 1, 1)),
+                obs=jnp.ones((3, 1, 1)) * initial_obs,
                 actions=jnp.ones((3, 1, 1)) * weight,
                 rewards=jnp.ones((3, 1)) * weight,
                 dones=jnp.zeros((3, 1), dtype=jnp.bool_),
@@ -1291,12 +1292,17 @@ def test_derived_sources_use_current_actor_and_do_not_touch_baseline():
     key_before = tree_fingerprint(context.key)
     workflow._stage_derived_sources(state, context)
     assert [source.source_type for source in context.derived_sources] == [
-        "RL-derived-small", "RL-derived-large"
+        "RL-unmutated-EC", "RL-derived-small", "RL-derived-large"
     ]
     assert all(source.eligible and source.batch is not None for source in context.derived_sources)
     assert all(source.valid_transition_count >= 2 for source in context.derived_sources)
-    assert context.derived_timesteps == 6
-    assert all(value > 0 for value in context.derived_behavior_distances.values())
+    assert context.derived_timesteps == 9
+    assert context.derived_behavior_distances["RL-unmutated-EC"] == 0
+    assert all(context.derived_behavior_distances[name] > 0
+               for name in ("RL-derived-small", "RL-derived-large"))
+    assert jnp.all(context.derived_sources[0].batch.actions == 2.0)
+    assert all(jnp.array_equal(source.batch.obs, context.derived_sources[0].batch.obs)
+               for source in context.derived_sources[1:])
     assert tree_fingerprint(state) == before
     assert tree_fingerprint(context.key) == key_before
     first = [(source.source_id, tree_fingerprint(source.batch)) for source in context.derived_sources]

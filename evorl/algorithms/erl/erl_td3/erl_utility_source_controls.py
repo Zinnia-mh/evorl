@@ -559,17 +559,26 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
         root = derive_diagnostic_key(context.key, context.generation, SOURCE_CONTROL_DERIVED_TAG)
         sources, steps = [], 0
         distances = {}
+        rollout_key = jax.random.fold_in(root, 0x524f4c4c)
+        sample_key = jax.random.fold_in(root, 0x53414d50)
+        expected = ("RL-unmutated-EC", "RL-derived-small", "RL-derived-large")
         for i, (name, strength) in enumerate((
-            ("RL-derived-small", float(self.config.derived_small_strength)),
-            ("RL-derived-large", float(self.config.derived_large_strength)),
+            (expected[0], 0.0),
+            (expected[1], float(self.config.derived_small_strength)),
+            (expected[2], float(self.config.derived_large_strength)),
         )):
-            mutation_key, rollout_key, sample_key = jax.random.split(jax.random.fold_in(root, i), 3)
-            leaves, treedef = jtu.tree_flatten(actor)
-            keys = jax.random.split(mutation_key, len(leaves))
-            mutated = jtu.tree_unflatten(treedef, [
-                x + strength * jax.random.normal(k, x.shape, x.dtype)
-                for x, k in zip(leaves, keys)
-            ])
+            if strength < 0:
+                raise ValueError("derived mutation strength must be nonnegative")
+            if strength == 0:
+                mutated = actor
+            else:
+                mutation_key = jax.random.fold_in(root, i)
+                leaves, treedef = jtu.tree_flatten(actor)
+                keys = jax.random.split(mutation_key, len(leaves))
+                mutated = jtu.tree_unflatten(treedef, [
+                    x + strength * jax.random.normal(k, x.shape, x.dtype)
+                    for x, k in zip(leaves, keys)
+                ])
             batched = jtu.tree_map(lambda x: jnp.expand_dims(x, 0), mutated)
             derived_state = erl_replace_td3_actor_params(agent_state, batched)
             metrics, trajectory = jax.vmap(
@@ -591,6 +600,10 @@ class ERLUtilitySourceControlsWorkflow(ERLLearnerUtilityWorkflow):
                 source_id=f"gen_{context.generation}_{name.lower()}",
                 evolutionary_fitness=float(jax.device_get(metrics.episode_returns.mean()))))
             steps += int(jax.device_get(metrics.episode_lengths.sum()))
+        if tuple(source.source_type for source in sources) != expected:
+            raise ValueError("derived source group is incomplete")
+        if any(not source.eligible or source.batch is None for source in sources):
+            raise ValueError("derived source has insufficient valid transitions")
         context.derived_sources, context.derived_timesteps = tuple(sources), steps
         context.derived_behavior_distances = distances
 
