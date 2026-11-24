@@ -506,6 +506,8 @@ def test_run_config_persists_complete_static_and_checkpoint_provenance(tmp_path)
             "baseline_prng_fingerprint": "prng-1",
             "replay_metadata_fingerprint": "replay-1",
             "temporal_alignment": "exact",
+            "derived_extra_timesteps": 2000,
+            "derived_behavior_distances": {"RL-derived-small": 0.01, "RL-derived-large": 0.1},
         },
     )
     writer.append_checkpoint(
@@ -553,6 +555,8 @@ def test_run_config_persists_complete_static_and_checkpoint_provenance(tmp_path)
             "baseline_prng_fingerprint": "prng-1",
             "replay_metadata_fingerprint": "replay-1",
             "temporal_alignment": "exact",
+            "derived_extra_timesteps": 2000,
+            "derived_behavior_distances": {"RL-derived-small": 0.01, "RL-derived-large": 0.1},
         },
         "2": {
             "baseline_prng_fingerprint": "prng-2",

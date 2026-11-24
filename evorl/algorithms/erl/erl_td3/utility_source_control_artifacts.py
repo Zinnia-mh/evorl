@@ -535,14 +535,7 @@ class UtilitySourceControlArtifactWriter:
             checkpoint_provenance_by_id = dict(
                 self.run_config.get("checkpoint_provenance", {})
             )
-            checkpoint_provenance_by_id[str(d.checkpoint)] = {
-                key: checkpoint_provenance[key]
-                for key in (
-                    "baseline_prng_fingerprint",
-                    "replay_metadata_fingerprint",
-                    "temporal_alignment",
-                )
-            }
+            checkpoint_provenance_by_id[str(d.checkpoint)] = dict(checkpoint_provenance)
             updated_config = dict(self.run_config)
             updated_config["checkpoint_provenance"] = checkpoint_provenance_by_id
             self._atomic_json("run_config.json", updated_config)
