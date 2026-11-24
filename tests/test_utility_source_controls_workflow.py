@@ -1287,7 +1287,8 @@ def test_derived_sources_use_current_actor_and_do_not_touch_baseline():
         critic_params=None, target_critic_params=None,
     )
     state = AgentState(params=params)
-    context = SimpleNamespace(key=jax.random.key(9), generation=20)
+    context = SimpleNamespace(key=jax.random.key(9), generation=20,
+        snapshot=SimpleNamespace(reference_batches=(SampleBatch(obs=jnp.ones((2, 1)) * 3),)))
     before = tree_fingerprint(state)
     key_before = tree_fingerprint(context.key)
     workflow._stage_derived_sources(state, context)
@@ -1303,6 +1304,11 @@ def test_derived_sources_use_current_actor_and_do_not_touch_baseline():
     assert jnp.all(context.derived_sources[0].batch.actions == 2.0)
     assert all(jnp.array_equal(source.batch.obs, context.derived_sources[0].batch.obs)
                for source in context.derived_sources[1:])
+    small_weight = context.derived_sources[1].batch.actions[0, 0]
+    large_weight = context.derived_sources[2].batch.actions[0, 0]
+    assert jnp.allclose(large_weight - 2.0, 10 * (small_weight - 2.0), atol=2e-6)
+    assert context.derived_fixed_behavior_distances["RL-unmutated-EC"] == 0
+    assert context.derived_fixed_observation_fingerprint == tree_fingerprint(context.snapshot.reference_batches[0].obs)
     assert tree_fingerprint(state) == before
     assert tree_fingerprint(context.key) == key_before
     first = [(source.source_id, tree_fingerprint(source.batch)) for source in context.derived_sources]
