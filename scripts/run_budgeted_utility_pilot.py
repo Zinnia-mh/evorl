@@ -15,25 +15,46 @@ from evorl.algorithms.erl.erl_td3.d0_shared_start import AuditedD0
 from evorl.algorithms.erl.erl_td3.utility_replay_budget import prepare_arm_manifest
 from evorl.algorithms.erl.erl_td3.utility_replay_smoke_workflow import initialization_fingerprint
 from evorl.algorithms.erl.erl_td3.utility_replay_training import run_training
+from evorl.algorithms.erl.erl_td3.utility_replay_checkpoint import PilotCheckpointStore,restore_template
 
-ROOT=Path("/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/algorithm/budgeted-scoring-v1")
+ROOT=Path("/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/algorithm/budgeted-scoring-v2")
 HISTORY=Path("/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/replication/swimmer/seed_2047/ad300-head43221c7-v1/runs/D0/resolved_config.yaml")
 SEED=3079
 
 def write(path,value):
     with Path(path).open("x") as f:json.dump(value,f,indent=2,allow_nan=False)
 
+def validate_shared_parent(parent, child):
+    """Only declared arm controls may differ at an exact shared warmup fork."""
+    excluded={"arm","score_kind","alpha","diagnostic_enabled","output_dir","arm_manifest_path"}
+    values=[{k:v for k,v in OmegaConf.to_container(c,resolve=True).items() if k not in excluded}
+            for c in (parent,child)]
+    if values[0]!=values[1]:
+        raise ValueError("shared warmup configuration differs beyond arm controls")
+
 class ObservedDistributed(DistributedScoringMixin,AuditedD0):
     pass
 
 class PilotObserver:
     audit_before_checkpoint=True
-    def __init__(self,label,stage,plan):
-        self.label=label;self.stage=stage;self.plan=plan
+    def __init__(self,label,stage,plan,parent=None):
+        self.label=label;self.stage=stage;self.plan=plan;self.parent=parent
         self.identity=dict(algorithm=label,seed=SEED,stage=stage,
             plan_sha256=hashlib.sha256(json.dumps(plan,sort_keys=True).encode()).hexdigest())
         self.workflow_type=ObservedDistributed if label=="S" else AuditedD0
         self.rows=[]
+    def fork_state(self,workflow,run_id):
+        parent=Path(self.parent).resolve()
+        parent_config=OmegaConf.load(parent.parents[3]/"resolved_config.yaml")
+        validate_shared_parent(parent_config,workflow.config)
+        with PilotCheckpointStore(parent.parent,parent_config,read_only=True) as reader:
+            state,runtime=reader.restore(10,restore_template(workflow))
+        if (int(state.metrics.iterations)!=10 or runtime["evaluations"]
+                or runtime["budget"]["steps"] or int(state.utility_replay_state.score_table.current_version)!=-1):
+            raise ValueError("parent is not an untouched complete warmup state")
+        self.parent_sha256=initialization_fingerprint(state)
+        return state,dict(runtime,run_id=run_id)
+
     def configure(self,workflow,segment):
         self.segment=segment
         if int(workflow.config.seed)!=SEED:raise ValueError("seed mismatch")
@@ -119,12 +140,13 @@ def _mean(a):
     a=[x for x in a if x is not None]
     return float(np.mean(a)) if a else None
 
-def prepare(stage):
+def prepare(stage,parent=None):
     directory=ROOT/stage
     directory.mkdir(parents=True,exist_ok=False)
     small=stage=="smoke"
     final=20 if small else 50
     plan=dict(seed=SEED,final_generation=final,warmup_generations=10,
+        shared_warmup_parent=str(parent) if parent else 'fresh A checkpoint10, shared exactly by D0 and S',
         evaluated_generations=list(range(20,final+1,10)),
         primary="Return AUC on common environment steps at evaluations g20..50",
         secondary=["early AUC g20..30","final Return","mean final3 evaluations","coverage/age","runtime"],
@@ -158,14 +180,16 @@ def prepare(stage):
         for p in directory.iterdir() if p.is_file()})
     return plan
 
-def run(stage,plan):
+def run(stage,plan,parent=None):
     directory=ROOT/stage
     summaries={}
     for label in plan["arms"]:
         config=OmegaConf.load(directory/("arm_uniform.yaml" if label=="A" else "arm_utility.yaml"))
-        observer=PilotObserver(label,stage,plan)
+        if label!="A" and parent is None:
+            parent=next((directory/"runs/A/segments").glob("*/checkpoints/10"))
+        observer=PilotObserver(label,stage,plan,parent=parent)
         started=time.perf_counter()
-        state,report=run_training(config,directory/"runs"/label,checkpoint_interval=10000,keep=2,ablation=observer)
+        state,report=run_training(config,directory/"runs"/label,checkpoint_interval=10000,keep=2,ablation=observer,fork=parent is not None)
         elapsed=time.perf_counter()-started
         result=dict(wall_seconds=elapsed,performance=report,mechanism=observer.summary(),
             final_prng=np.asarray(state.key).tolist(),final_ec_prng=np.asarray(state.ec_opt_state.key).tolist())
@@ -188,13 +212,14 @@ def run(stage,plan):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--stage",choices=["smoke","pilot"],required=True)
+    p.add_argument("--parent",type=Path)
     args=p.parse_args()
     if jax.default_backend()!="gpu" or subprocess.check_output(["git","status","--porcelain"],text=True).strip():
         raise ValueError("clean committed GPU version required")
     if args.stage=="pilot":
         smoke=json.loads((ROOT/"smoke/summary.json").read_text())
         if smoke["S"]["mechanism"]["total_real_scores"]!=32:raise ValueError("Smoke incomplete")
-    plan=prepare(args.stage)
-    run(args.stage,plan)
+    plan=prepare(args.stage,args.parent)
+    run(args.stage,plan,args.parent)
 
 if __name__=="__main__":main()

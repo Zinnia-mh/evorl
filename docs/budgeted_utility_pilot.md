@@ -37,3 +37,11 @@ Execution plan:
 - End with descriptive paired comparisons. An AUC improvement over both A/D0
   with no material final-return regression merits further controlled testing;
   otherwise HOLD expansion, revisit hypothesis. No statistical claim from1seed.
+
+Shared-start correction: tiny Smoke found63 warmup Replay floats differed by
+at most2.63e-6 across independent JIT warmups; params/optimizer/population/keys
+were identical. OriginalfailedSmoke stays frozen in budgeted-scoring-v1.
+All comparison arms now fork the same complete native A warmup checkpoint10,
+validated read-only with full SHA and config equality except declared arm
+controls. This removes numeric warmup differences and saves repeated warmup.
+Retry and Pilot outputs use budgeted-scoring-v2. No algorithm change.

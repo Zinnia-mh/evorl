@@ -66,3 +66,19 @@ def test_selected_score_update_reaches_sampler_preserving_rl_slots():
     assert np.all(np.asarray(replay.origin_type)[f]==np.asarray(replay.origin_type)[b])
     assert distribution.transition_cdf.dtype==jnp.float64
     assert not jax.config.jax_enable_x64
+
+
+def test_shared_warmup_contract_allows_only_declared_arm_controls():
+    from omegaconf import OmegaConf
+    from scripts import run_budgeted_utility_pilot as runner
+    assert hasattr(runner,"validate_shared_parent"), "shared warmup validation missing"
+    a=OmegaConf.create(dict(arm="uniform",score_kind="uniform",alpha=0,
+        diagnostic_enabled=False,output_dir="/old",arm_manifest_path="/old/manifest",
+        seed=3079,replay_buffer_capacity=1000,optimizer=dict(lr=.0003)))
+    b=OmegaConf.create(OmegaConf.to_container(a))
+    b.arm="utility";b.score_kind="utility";b.alpha=.5;b.diagnostic_enabled=True
+    b.output_dir="/new";b.arm_manifest_path="/new/manifest"
+    runner.validate_shared_parent(a,b)
+    b.optimizer.lr=.001
+    with pytest.raises(ValueError,match="shared"):
+        runner.validate_shared_parent(a,b)
