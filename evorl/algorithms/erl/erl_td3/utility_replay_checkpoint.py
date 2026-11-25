@@ -92,7 +92,10 @@ class PilotCheckpointStore:
         if metadata.get('schema')!=2 or metadata['config_contract']!=config_contract(self.config) or metadata['mechanism_digest']!=mechanism_digest() or metadata['environment']!=environment_contract():raise ValueError('incompatible checkpoint configuration, implementation or environment')
         template=_saved_template(template,metadata['leaf_specs'])
         abstract=jax.tree.map(lambda x:None if _empty(x) else x,template)
-        result=self.manager.restore(step,args=ocp.args.Composite(state=ocp.args.StandardRestore(abstract),runtime=ocp.args.JsonRestore()))
-        restored=jax.tree.map(lambda src,dst:jnp.zeros(src.shape,src.dtype) if _empty(src) else dst,template,result.state)
+        # Preserve the sampler's float64 CDF during native deserialization;
+        # model arrays retain their explicit saved float32 dtypes.
+        with jax.enable_x64(True):
+            result=self.manager.restore(step,args=ocp.args.Composite(state=ocp.args.StandardRestore(abstract),runtime=ocp.args.JsonRestore()))
+            restored=jax.tree.map(lambda src,dst:jnp.zeros(src.shape,src.dtype) if _empty(src) else dst,template,result.state)
         if int(restored.metrics.iterations)!=step or initialization_fingerprint(restored)!=metadata['state_sha256']:raise ValueError('restored full-state checksum mismatch')
         return restored,metadata['runtime']

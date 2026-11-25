@@ -1051,3 +1051,71 @@ def test_real_overlay_eager_and_jit_are_exactly_equal():
         baseline_indices, origin_type, distribution, key
     )
     chex.assert_trees_all_equal(eager, compiled)
+
+
+def test_interleaved_source_cdf_preserves_source_mass_without_global_x64():
+    import numpy as np
+    enabled_before = jax.config.jax_enable_x64
+    size = 100003
+    tokens = np.arange(size, dtype=np.int32) % 3
+    mask = np.arange(size) % 17 != 0
+    tokens[~mask] = -1
+    counts = np.bincount(tokens[mask], minlength=3)
+    table = init_source_score_table(3)._replace(
+        source_token=jnp.arange(3, dtype=jnp.int32),
+        resident_count=jnp.asarray(counts, dtype=jnp.int32),
+        rank_normalized_score=jnp.array([0., .5, 1.]),
+        weighted_eligible=jnp.ones(3, dtype=bool),
+    )
+    dist = build_weighted_source_distribution(
+        table, jnp.asarray(tokens), jnp.asarray(mask), .5, .5
+    )
+    cdf = np.asarray(dist.transition_cdf, dtype=np.float64)
+    intervals = np.diff(np.r_[0., cdf])
+    actual = np.bincount(tokens[mask], weights=intervals[mask], minlength=3)
+    target = np.asarray(dist.source_probability, dtype=np.float64)
+    target /= target.sum()
+    assert np.abs(actual-target).sum() < 1e-7
+    assert np.all(intervals[~mask] == 0), "zero-probability slots must have no CDF interval"
+    assert np.all(intervals >= 0)
+    assert cdf[-1] == 1.
+    assert jax.config.jax_enable_x64 == enabled_before
+
+
+def test_sampler_has_no_mass_on_padding_and_never_changes_global_precision():
+    import numpy as np
+    table, tokens, mask = _sampler_fixture()
+    dist = build_weighted_source_distribution(table, tokens, mask, .5, .5)
+    before = jax.config.jax_enable_x64
+    samples = jax.jit(lambda key: sample_weighted_ea_indices(dist, key, 4096))(
+        jax.random.PRNGKey(231)
+    )
+    idx = np.asarray(samples.sampled_indices)
+    assert np.all(np.asarray(dist.transition_probability)[idx] > 0)
+    assert np.all(np.asarray(mask)[idx])
+    assert jax.config.jax_enable_x64 == before
+    assert jnp.ones(1).dtype == jnp.float32
+
+
+def test_sampling_boundaries_skip_zero_mass_slots(monkeypatch):
+    from evorl.algorithms.erl.erl_td3.source_replay import build_sampling_cdf
+    probability = jnp.array([0., .2, 0., .3, 0., .5, 0., 0.])
+    cdf = jax.jit(build_sampling_cdf)(probability)
+    dist = SimpleNamespace(transition_probability=probability, transition_cdf=cdf,
+                           has_resident_ea=jnp.array(True))
+    monkeypatch.setattr(jax.random, "bits",
+                        lambda key, shape, dtype: jnp.array(
+                            [[0, 0xffffffff], [0, 0xffffffff]], dtype=dtype))
+    result = jax.jit(lambda k: sample_weighted_ea_indices(dist, k, 2))(jax.random.PRNGKey(1))
+    chex.assert_trees_all_equal(result.sampled_indices, jnp.array([1, 5], dtype=jnp.int32))
+
+
+def test_initial_cdf_and_abstract_checkpoint_template_use_same_precision():
+    from evorl.algorithms.erl.erl_td3.erl_utility_replay import init_utility_replay_state
+    before = jax.config.jax_enable_x64
+    actual = init_utility_replay_state(16, jax.random.PRNGKey(0))
+    template = jax.eval_shape(lambda k: init_utility_replay_state(16, k), jax.random.PRNGKey(0))
+    assert actual.distribution.transition_cdf.dtype == template.distribution.transition_cdf.dtype
+    assert actual.distribution.transition_cdf.dtype == jnp.float64
+    assert actual.distribution.transition_probability.dtype == jnp.float32
+    assert jax.config.jax_enable_x64 == before

@@ -294,10 +294,7 @@ def build_weighted_source_distribution(
     transition_probability = jnp.where(
         mapped_ea & has_resident_ea, transition_probability, 0.0
     ).astype(jnp.float32)
-    transition_cdf = jnp.cumsum(transition_probability)
-    transition_cdf = transition_cdf.at[-1].set(
-        jnp.where(has_resident_ea, jnp.maximum(transition_cdf[-1], 1.0), 0.0)
-    )
+    transition_cdf = build_sampling_cdf(transition_probability)
 
     squared_mass = jnp.sum(source_probability**2)
     effective_source_count = jnp.where(
@@ -335,6 +332,29 @@ def build_weighted_source_distribution(
     )
 
 
+def build_sampling_cdf(transition_probability: chex.Array) -> chex.Array:
+    """Build a monotone float64 CDF without enabling x64 for the learner.
+
+    Float32 prefix-sum errors can aggregate coherently over interleaved source
+    identities even when every cumulative error is small. Normalize only the
+    sampling representation; analytical source/transition probabilities remain
+    unchanged. Carry valid boundaries over zero-mass slots so they cannot gain
+    an interval through rounding or the terminal boundary correction.
+    """
+    with jax.enable_x64(True):
+        positive = transition_probability > 0
+        cdf = jnp.cumsum(transition_probability.astype(jnp.float64))
+        total = cdf[-1]
+        cdf = jnp.minimum(cdf / jnp.where(total > 0, total, 1.0), 1.0)
+        last_positive = jnp.max(jnp.where(
+            positive, jnp.arange(cdf.shape[0], dtype=jnp.int32), 0
+        ))
+        cdf = cdf.at[last_positive].set(jnp.where(total > 0, 1.0, 0.0))
+        return jax.lax.associative_scan(
+            jnp.maximum, jnp.where(positive, cdf, 0.0)
+        )
+
+
 def sample_weighted_ea_indices(
     distribution: WeightedSourceDistribution,
     intervention_key: chex.PRNGKey,
@@ -346,13 +366,19 @@ def sample_weighted_ea_indices(
         raise ValueError("sample_size must be non-negative")
     sample_key, next_intervention_key = jax.random.split(intervention_key)
     capacity = distribution.transition_probability.shape[0]
-    safe_cdf = jnp.where(
-        distribution.has_resident_ea,
-        distribution.transition_cdf,
-        jnp.ones((capacity,), dtype=jnp.float32),
-    )
-    draws = jax.random.uniform(sample_key, shape=(sample_size,))
-    sampled = jnp.searchsorted(safe_cdf, draws, side="right").astype(jnp.int32)
+    # Two independent 26-bit mantissas provide a uniform 52-bit grid.
+    # Keep PRNG integer operations uint32: scoped uint64 random.uniform lowering
+    # is incompatible with an outer x64-disabled JIT in JAX 0.9.
+    bits = jax.random.bits(sample_key, (2, sample_size), dtype=jnp.uint32)
+    with jax.enable_x64(True):
+        safe_cdf = jnp.where(
+            distribution.has_resident_ea,
+            distribution.transition_cdf.astype(jnp.float64),
+            jnp.ones((capacity,), dtype=jnp.float64),
+        )
+        draws = (bits[0] >> jnp.uint32(6)).astype(jnp.float64) * jnp.float64(2**-26)
+        draws += (bits[1] >> jnp.uint32(6)).astype(jnp.float64) * jnp.float64(2**-52)
+        sampled = jnp.searchsorted(safe_cdf, draws, side="right").astype(jnp.int32)
     sampled = jnp.minimum(sampled, capacity - 1)
     sampled = jnp.where(distribution.has_resident_ea, sampled, -1)
     return WeightedSampleResult(

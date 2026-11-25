@@ -158,12 +158,15 @@ def init_utility_replay_state(
     replay_capacity = int(replay_capacity)
     zero_source = jnp.zeros((1,), dtype=jnp.float32)
     zero_transition = jnp.zeros((replay_capacity,), dtype=jnp.float32)
+    # The restore template must agree with the scoped-precision sampler CDF.
+    with jax.enable_x64(True):
+        zero_cdf = jnp.zeros((replay_capacity,), dtype=jnp.float64)
     distribution = WeightedSourceDistribution(
         baseline_source_probability=zero_source,
         weighted_source_probability=zero_source,
         source_probability=zero_source,
         transition_probability=zero_transition,
-        transition_cdf=zero_transition,
+        transition_cdf=zero_cdf,
         n_ea=jnp.asarray(0, dtype=jnp.int32),
         eligible_source_count=jnp.asarray(0, dtype=jnp.int32),
         resident_source_count=jnp.asarray(0, dtype=jnp.int32),
