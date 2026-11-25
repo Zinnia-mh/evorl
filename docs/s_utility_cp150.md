@@ -38,3 +38,19 @@ evorl/. This intentionally preserves the parent mechanism digest.
 Recovery: save a sealed child start checkpoint before the first new step;
 canonicalize repeated-generation journals after rollback and record discarded
 score calls separately. These safeguards do not change training or P.
+
+## Completed CP150 result (seed3079)
+
+All A/S/P completed with matched4.94M-step logical budgets,2.24M Actor/4.48M Critic updates,14x128-episode evaluations;S/P448 true scores. Six new targeted tests pass; original Pilot prefix and native state/RNG/input checks pass. No restarts or extra experiments.
+
+|Arm|AUC20..150|AUC50..150|Last5 Return|Final Return|
+|---|---:|---:|---:|---:|
+|A|666324718.44|596588625.07|263.567|363.336|
+|S|1278324616.30|1191476465.61|366.832|366.259|
+|P|1170463639.07|1101747419.47|367.663|368.049|
+
+S/A AUC gains+91.85%/+99.71%;S/P+9.22%/+8.14%. S's jump persists, but P catches up by~g70 and slightly exceeds S late Return. This supports a small early ranking margin, not proven Utility necessity. P/A primary gain+75.66% shows much of the benefit survives permutation. Same-seed checkpoints are not independent seed replicates.
+
+Full post-warmup step times:A38.01min,S98.57min,P97.53min;S/A2.593x. New-stage wall3.333h. HOLD large formal training; at most a preregistered new-seed A/S/P replication should test the modest S/P speed difference before expanding. No further training launched.
+
+Remote full report/curves: /disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/algorithm/budgeted-scoring-cp150-v1/REPORT.md
