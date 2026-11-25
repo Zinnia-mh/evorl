@@ -221,6 +221,7 @@ class ERLLearnerUtilityWorkflow(ERLWorkflow):
             source_batch_size=self.config.source_batch_size,
             key=source_key,
         )
+        sources = self._select_diagnostic_sources(sources)
         if not bool(jax.device_get(self.replay_buffer.can_sample(replay_buffer_state))):
             return tuple(
                 DiagnosticRecord(
@@ -268,6 +269,10 @@ class ERLLearnerUtilityWorkflow(ERLWorkflow):
             checkpoint=context.generation,
             evaluate=evaluate,
         )
+
+    def _select_diagnostic_sources(self, sources):
+        """Default keeps the original complete-population diagnostic unchanged."""
+        return sources
 
     def _evaluate_source_utility(self, source_batch, reference_batch, key):
         """Use the active TD3 objective and a discarded functional Optax update."""
