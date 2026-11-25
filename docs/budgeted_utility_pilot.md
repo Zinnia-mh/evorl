@@ -45,3 +45,11 @@ All comparison arms now fork the same complete native A warmup checkpoint10,
 validated read-only with full SHA and config equality except declared arm
 controls. This removes numeric warmup differences and saves repeated warmup.
 Retry and Pilot outputs use budgeted-scoring-v2. No algorithm change.
+
+## Completed results (seed3079, no further training)
+
+All three arms finishedg50. A/D0/S Return AUC:69736093.37/54524262.08/86848150.69; final Return:60.293/81.768/310.543. S passes the frozen10% AUC signal gate (+24.54%vsA,+59.28%vsD0), but trails A atg20/30/40 and wins through theg50 jump. Early AUC20..30 is27.43%belowA; no stable-return claim.
+
+D0/S each128 real scores. Mean coverage5.395%/6.848%; comparableg20..50 score age9.677/11.232generations, so improved freshness is not established. Post-warmup step time973.94/1707.03seconds(S1.753xD0). Smaller scoring cohorts also change rank granularity despite the same formula. All counters/PRNG/input audits pass;9targeted tests and realSmoke pass. Native completed reports/checkpoints verified. HOLD full formal training; positive preliminary signal merits limited independent-seed performance replication and a same-schedule rank-placebo control. No more experiments launched.
+
+Full remote report/curves: /disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/algorithm/budgeted-scoring-v2/pilot/REPORT.md
