@@ -69,4 +69,4 @@ Original plan and revision evidence remain in the new remote artifact directory.
 LCERL motivation only: late evolution and opposite proximal perturbations;
 this is not its adaptive operator, clustering archive or full architecture.
 Primary author-group description:
-https://www.translab.top/index.php/en/2026/01/20/%E3%80%90ep39-%C2%B7-research-highlights%E3%80%91-evolutionary-reinforcement-learning-with-late-start-evolution-and-clustering-archive-published-in-ieee-tevc/
+[Author-group LCERL summary](https://www.translab.top/index.php/en/2026/01/20/%E3%80%90ep39-%C2%B7-research-highlights%E3%80%91-evolutionary-reinforcement-learning-with-late-start-evolution-and-clustering-archive-published-in-ieee-tevc/)
