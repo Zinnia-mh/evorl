@@ -29,7 +29,7 @@ def pick_batch(replay,indices,key,count=256):
     selected=jax.random.choice(key,jnp.asarray(indices),shape=(count,),replace=False)
     return jax.tree.map(lambda x:x[selected],replay.data)
 
-def main():
+def main(ROOT=ROOT,BASE=BASE,generations=(50,100,150)):
     if jax.default_backend()!="gpu":raise ValueError("GPU diagnostic required")
     if (ROOT/"utility_records.jsonl").exists():raise FileExistsError("diagnostic already started; preserve previous artifact")
     mresult=json.loads((ROOT/"summary-M.json").read_text())
@@ -41,7 +41,7 @@ def main():
     obs=jnp.asarray(np.load(ROOT/"fixed_observations.npz")["obs"])
     summaries=[];metadata=[];started=time.perf_counter()
     with (ROOT/"utility_records.jsonl").open("x") as stream:
-        for g in (50,100,150):
+        for g in generations:
             w,m,_=load_checkpoint(checkpoint_segment(ROOT/"runs/M",g),g,cm)
             wa,a,_=load_checkpoint(checkpoint_segment(BASE/"runs/A",g),g,ca)
             h_m,h_a=initialization_fingerprint(m),initialization_fingerprint(a)
