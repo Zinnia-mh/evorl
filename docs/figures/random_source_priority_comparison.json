@@ -1,0 +1,168 @@
+{
+  "seeds": {
+    "3083": {
+      "A": {
+        "auc20_150": 894049713.5353088,
+        "final_return": 366.11181640625,
+        "last5_mean": 365.798681640625,
+        "postwarmup_step_seconds": 2185.501779574901,
+        "first350": {
+          "generation": 90,
+          "environment_timesteps": 2960000,
+          "environment_episodes": 2960,
+          "return_mean": 360.48565673828125,
+          "return_mean_by_rl_agent": [
+            360.48565673828125
+          ],
+          "mean_episode_lengths": [
+            1000.0
+          ],
+          "postwarmup_training_seconds": 1282.5483307354152
+        },
+        "process_wall_seconds": 2454.6657737041824,
+        "eligible_coverage_mean": 0.0,
+        "ea_conditional_tv_mean": 0.0
+      },
+      "P": {
+        "auc20_150": 1352259690.39917,
+        "final_return": 365.5118408203125,
+        "last5_mean": 367.13185424804686,
+        "postwarmup_step_seconds": 5817.167852486949,
+        "first350": {
+          "generation": 50,
+          "environment_timesteps": 1640000,
+          "environment_episodes": 1640,
+          "return_mean": 362.56036376953125,
+          "return_mean_by_rl_agent": [
+            362.56036376953125
+          ],
+          "mean_episode_lengths": [
+            1000.0
+          ],
+          "postwarmup_training_seconds": 1707.8485232614912
+        },
+        "process_wall_seconds": 5946.778420852963,
+        "eligible_coverage_mean": 0.09099464657213564,
+        "ea_conditional_tv_mean": 0.01478091564661424
+      },
+      "R": {
+        "auc20_150": 970001576.2710571,
+        "final_return": 370.6451110839844,
+        "last5_mean": 368.6315979003906,
+        "postwarmup_step_seconds": 2832.345395233482,
+        "first350": {
+          "generation": 90,
+          "environment_timesteps": 2960000,
+          "environment_episodes": 2960,
+          "return_mean": 363.43963623046875,
+          "return_mean_by_rl_agent": [
+            363.43963623046875
+          ],
+          "mean_episode_lengths": [
+            1000.0
+          ],
+          "postwarmup_training_seconds": 1662.8388247564435
+        },
+        "process_wall_seconds": 2968.6086637037806,
+        "eligible_coverage_mean": 0.09099464657213564,
+        "ea_conditional_tv_mean": 0.014780908057166796
+      },
+      "R_over_A_auc": 0.08495261682419719,
+      "R_over_P_auc": -0.2826809945176101,
+      "R_over_P_step_time": 0.4868942184679441,
+      "R_over_A_step_time": 1.2959702992254702,
+      "near_P": false,
+      "near_A": false,
+      "meaningfully_faster_P": true,
+      "source_selection_comparison_P": {
+        "available": true,
+        "generations_compared": 140,
+        "generations_equal": 140
+      }
+    },
+    "3079": {
+      "A": {
+        "auc20_150": 666324718.4371948,
+        "final_return": 363.33551025390625,
+        "last5_mean": 263.56739349365233,
+        "postwarmup_step_seconds": 2280.7363584521227,
+        "first350": {
+          "generation": 130,
+          "environment_timesteps": 4280000,
+          "environment_episodes": 4280,
+          "return_mean": 351.0285949707031,
+          "return_mean_by_rl_agent": [
+            351.0285949707031
+          ],
+          "mean_episode_lengths": [
+            1000.0
+          ],
+          "postwarmup_training_seconds": 1977.345675433986
+        },
+        "process_wall_seconds": 1710.9311011279933,
+        "eligible_coverage_mean": 0.0,
+        "ea_conditional_tv_mean": 0.0
+      },
+      "P": {
+        "auc20_150": 1170463639.0686035,
+        "final_return": 368.04949951171875,
+        "last5_mean": 367.663232421875,
+        "postwarmup_step_seconds": 5852.071676512249,
+        "first350": {
+          "generation": 70,
+          "environment_timesteps": 2300000,
+          "environment_episodes": 2300,
+          "return_mean": 359.68902587890625,
+          "return_mean_by_rl_agent": [
+            359.68902587890625
+          ],
+          "mean_episode_lengths": [
+            1000.0
+          ],
+          "postwarmup_training_seconds": 2541.331254386343
+        },
+        "process_wall_seconds": 5979.490461193025,
+        "eligible_coverage_mean": 0.09099464657213564,
+        "ea_conditional_tv_mean": 0.014780896684221391
+      },
+      "R": {
+        "auc20_150": 1006395551.9485474,
+        "final_return": 368.77899169921875,
+        "last5_mean": 367.9092041015625,
+        "postwarmup_step_seconds": 2834.8610948263668,
+        "first350": {
+          "generation": 80,
+          "environment_timesteps": 2630000,
+          "environment_episodes": 2630,
+          "return_mean": 352.8155517578125,
+          "return_mean_by_rl_agent": [
+            352.8155517578125
+          ],
+          "mean_episode_lengths": [
+            1000.0
+          ],
+          "postwarmup_training_seconds": 1471.58306719549
+        },
+        "process_wall_seconds": 2971.109737277031,
+        "eligible_coverage_mean": 0.09099464657213564,
+        "ea_conditional_tv_mean": 0.01478091508199993
+      },
+      "R_over_A_auc": 0.5103680294330943,
+      "R_over_P_auc": -0.14017358732357832,
+      "R_over_P_step_time": 0.484420091128464,
+      "R_over_A_step_time": 1.242958698106744,
+      "near_P": false,
+      "near_A": false,
+      "meaningfully_faster_P": true,
+      "source_selection_comparison_P": {
+        "available": true,
+        "generations_compared": 140,
+        "generations_equal": 140
+      }
+    }
+  },
+  "second_seed_triggered": true,
+  "second_seed_completed": true,
+  "interpretation": "development seeds separate, no pooling; priorities not measured Utility",
+  "timing": "post-CP10 real synchronized training steps; shared warmup excluded for all arms"
+}
