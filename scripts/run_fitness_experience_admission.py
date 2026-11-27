@@ -593,7 +593,8 @@ def train(seed, label):
         raise ValueError("GPU smoke must pass before formal pilot")
     seed_root = ROOT / f"seed_{seed}"
     output = seed_root / "runs" / label
-    config = OmegaConf.load(seed_root / "protocol" / "arm_uniform.yaml")
+    protocol = "protocol-random" if label == "F-Random16" else "protocol"
+    config = OmegaConf.load(seed_root / protocol / "arm_uniform.yaml")
     config.admission_mode = ARMS[label]
     observer = AdmissionObserver(plan, seed, label)
     resume = find_resume_checkpoint(output) if output.exists() else None
