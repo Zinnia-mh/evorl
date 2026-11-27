@@ -491,6 +491,18 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
     def name(cls):
         return "ERL-Utility-Replay"
 
+    @classmethod
+    def _validate_replay_config(cls, config):
+        """Validate the canonical Utility Replay contract."""
+        del cls
+        validate_arm_config(config)
+
+    @classmethod
+    def _weighted_sampling_enabled(cls, config) -> bool:
+        """Return whether the real learner must use the replay overlay path."""
+        del cls
+        return float(config.alpha) > 0.0
+
     def setup(self, key):
         state = super().setup(key)
         intervention_key = jax.random.fold_in(
@@ -559,7 +571,7 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
 
     @classmethod
     def _build_from_config(cls, config):
-        validate_arm_config(config)
+        cls._validate_replay_config(config)
         encode_source_token(
             int(config.warmup_iters), int(config.pop_size) - 1,
             int(config.pop_size),
@@ -575,7 +587,7 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
             sample_batch_size=baseline.sample_batch_size,
         )
 
-        if alpha > 0.0:
+        if cls._weighted_sampling_enabled(config):
             def _weighted_rl_sample_and_update_fn(carry, unused_t):
                 del unused_t
                 (
@@ -701,6 +713,26 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
         self._capture_learner_trace(trace)
         return td3_metrics, agent_state, opt_state, utility_replay_state
 
+    def _refresh_active_replay_distribution(
+        self,
+        utility_replay_state,
+        replay_buffer_state,
+        *,
+        current_generation,
+    ):
+        """Refresh the canonical source-score distribution once per generation."""
+        return refresh_replay_distribution(
+            utility_replay_state,
+            replay_buffer_state,
+            current_generation=current_generation,
+            freshness_window=int(getattr(self.config, "freshness_window", 3)),
+            min_resident=int(getattr(self.config, "min_resident", 1)),
+            alpha=float(self.config.alpha),
+            replay_temperature=float(self.config.replay_temperature),
+            timing_sink=self._latest_score_lifecycle_audit,
+            rank_transform=getattr(self, "_ablation_rank_transform", None),
+        )
+
     def _weighted_step(self, state):
         """Mirror Original ERL while carrying only pilot intervention state."""
         start_t = time.perf_counter()
@@ -741,16 +773,10 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
             agent_state, replay_buffer_state, rl_rollout_key
         )
         refresh_start = time.perf_counter()
-        utility_replay_state = refresh_replay_distribution(
+        utility_replay_state = self._refresh_active_replay_distribution(
             utility_replay_state,
             replay_buffer_state,
             current_generation=int(jax.device_get(iterations)),
-            freshness_window=int(getattr(self.config, "freshness_window", 3)),
-            min_resident=int(getattr(self.config, "min_resident", 1)),
-            alpha=float(self.config.alpha),
-            replay_temperature=float(self.config.replay_temperature),
-            timing_sink=self._latest_score_lifecycle_audit,
-            rank_transform=getattr(self, "_ablation_rank_transform", None),
         )
         self._active_utility_replay_state = utility_replay_state
         self._latest_score_lifecycle_audit["resident_and_refresh_seconds"] = (
@@ -871,7 +897,7 @@ class ERLUtilityReplayWorkflow(ERLLearnerUtilityWorkflow):
         return train_metrics, state
 
     def step(self, state):
-        if float(self.config.alpha) == 0.0:
+        if not self._weighted_sampling_enabled(self.config):
             observer = getattr(self, "_calibration_observer", None)
             if observer is not None:
                 observer.begin(self, state)

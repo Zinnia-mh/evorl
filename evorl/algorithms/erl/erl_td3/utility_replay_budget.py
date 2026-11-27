@@ -112,8 +112,13 @@ def validate_arm_manifest(config):
 class BudgetAudit:
     """Host-side counters; never enters learner state or training PRNG."""
 
-    def __init__(self, config, *, initial_episodes, initial_iteration, initial_timesteps=0):
+    @classmethod
+    def _validate_config(cls, config):
+        del cls
         validate_arm_config(config)
+
+    def __init__(self, config, *, initial_episodes, initial_iteration, initial_timesteps=0):
+        self._validate_config(config)
         self.config = config
         self.initial_episodes = int(initial_episodes)
         self.initial_iteration = int(initial_iteration)

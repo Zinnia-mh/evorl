@@ -1,12 +1,17 @@
+from types import SimpleNamespace
+
 import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from evorl.algorithms.erl.erl_td3.erl_utility_replay import weighted_replay_sample
 from evorl.algorithms.erl.erl_td3.temporal_replay import (
+    MODE_ORIGINAL,
     MODE_RECENT_30,
     MODE_STRATIFIED_5_25,
+    TemporalStratifiedReplayWorkflow,
     build_temporal_ea_distribution,
 )
 from evorl.replay_buffers.source_aware_replay_buffer import (
@@ -14,6 +19,10 @@ from evorl.replay_buffers.source_aware_replay_buffer import (
     RL_ORIGIN,
     SourceAwareReplayBufferState,
     UNSET_ORIGIN,
+)
+from scripts.run_temporal_stratified_replay import (
+    TemporalBudgetAudit,
+    make_base_config,
 )
 
 
@@ -123,3 +132,70 @@ def test_overlay_changes_ea_indices_and_preserves_each_rl_index():
     np.testing.assert_array_equal(final[rl], baseline[rl])
     assert np.any(final[ea] != baseline[ea])
     assert np.all(np.isin(final[ea], [0, 4, 5]))
+
+
+def test_workflow_enables_overlay_only_for_b_and_c():
+    for mode, expected in (
+        (MODE_ORIGINAL, False),
+        (MODE_RECENT_30, True),
+        (MODE_STRATIFIED_5_25, True),
+    ):
+        config = SimpleNamespace(
+            temporal_mode=mode,
+            alpha=0.0,
+            diagnostic_enabled=False,
+            arm="uniform",
+            score_kind="uniform",
+            recent_generations=5,
+            history_generations=25,
+        )
+        assert TemporalStratifiedReplayWorkflow._weighted_sampling_enabled(config) is expected
+        TemporalStratifiedReplayWorkflow._validate_replay_config(config)
+
+
+def test_temporal_config_rejects_utility_or_fitness_interventions():
+    base = dict(
+        temporal_mode=MODE_RECENT_30,
+        alpha=0.0,
+        diagnostic_enabled=False,
+        arm="uniform",
+        score_kind="uniform",
+        recent_generations=5,
+        history_generations=25,
+    )
+    for changed in (
+        {"alpha": 0.5},
+        {"diagnostic_enabled": True},
+        {"score_kind": "utility"},
+        {"recent_generations": 6},
+    ):
+        config = SimpleNamespace(**(base | changed))
+        with pytest.raises(ValueError):
+            TemporalStratifiedReplayWorkflow._validate_replay_config(config)
+
+
+@pytest.mark.parametrize(
+    ("mode", "weighted"),
+    ((MODE_ORIGINAL, False), (MODE_RECENT_30, True), (MODE_STRATIFIED_5_25, True)),
+)
+def test_resolved_config_builds_only_the_intended_learner_path(mode, weighted):
+    config = make_base_config("smoke")
+    config.temporal_mode = mode
+    workflow = TemporalStratifiedReplayWorkflow.build_from_config(
+        config, enable_jit=False
+    )
+    try:
+        assert callable(workflow._rl_sample_and_update_fn)
+        assert workflow._rl_sample_and_update_fn.__name__.startswith("_weighted") is weighted
+        assert all(
+            cls.__name__ != "FitnessExperienceAdmissionWorkflow"
+            for cls in type(workflow).__mro__
+        )
+        TemporalBudgetAudit(
+            config,
+            initial_episodes=0,
+            initial_iteration=0,
+            initial_timesteps=0,
+        )
+    finally:
+        workflow.close()

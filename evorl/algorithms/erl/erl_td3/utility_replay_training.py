@@ -19,8 +19,8 @@ def _json(value):
 def _counters(state):
     return dict(generation=int(state.metrics.iterations),episodes=int(state.metrics.sampled_episodes),timesteps=int(state.metrics.sampled_timesteps),actor_optimizer_count=_optimizer_step_count(state.opt_state.actor),critic_optimizer_count=_optimizer_step_count(state.opt_state.critic))
 def _budget(audit):return {k:v for k,v in vars(audit).items() if k!='config'}
-def _attach(workflow,runtime):
-    b=runtime['budget'];audit=BudgetAudit(workflow.config,initial_episodes=b['initial_episodes'],initial_iteration=b['initial_iteration'],initial_timesteps=b['initial_timesteps'])
+def _attach(workflow,runtime,audit_type=BudgetAudit):
+    b=runtime['budget'];audit=audit_type(workflow.config,initial_episodes=b['initial_episodes'],initial_iteration=b['initial_iteration'],initial_timesteps=b['initial_timesteps'])
     for key,value in b.items():
         if key not in vars(audit) or key=='config':raise ValueError('unknown budget checkpoint field')
         setattr(audit,key,value)
@@ -43,7 +43,10 @@ def _lock(directory):
 
 def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation=None,checkpoint_interval=50,keep=3,ablation=None,fork=False):
     c=OmegaConf.create(OmegaConf.to_container(config,resolve=True));directory=Path(directory).resolve()
-    validate_arm_manifest(c)
+    if ablation is not None and hasattr(ablation,'validate_config'):
+        ablation.validate_config(c)
+    else:
+        validate_arm_manifest(c)
     if c.workflow_cls!=WORKFLOW or not c.save_replay_buffer or c.checkpoint.enable:raise ValueError('durable Pilot requires full replay and one runner-owned native checkpoint manager')
     if checkpoint_interval<1 or keep<2:raise ValueError('checkpoint interval>=1 and keep>=2 required')
     c.output_dir=str(directory)
@@ -84,14 +87,14 @@ def run_training(config,directory,*,resume_checkpoint=None,stop_after_generation
                 if ablation is not None and hasattr(ablation,'validate_resume'):
                     ablation.validate_resume(resume_checkpoint,state)
                 workflow.recorder.init();restored_hash=initialization_fingerprint(state)
-                audit=_attach(workflow,runtime)
+                audit=_attach(workflow,runtime,getattr(ablation,'budget_audit_type',BudgetAudit))
             elif fork:
                 state,runtime=ablation.fork_state(workflow,manifest['run_id'])
                 workflow.recorder.init();restored_hash=initialization_fingerprint(state)
-                audit=_attach(workflow,runtime)
+                audit=_attach(workflow,runtime,getattr(ablation,'budget_audit_type',BudgetAudit))
             else:
                 state=workflow.init(jax.random.PRNGKey(int(c.seed)));initial=_counters(state)
-                audit=BudgetAudit(c,initial_episodes=initial['episodes'],initial_iteration=initial['generation'],initial_timesteps=initial['timesteps'])
+                audit=getattr(ablation,'budget_audit_type',BudgetAudit)(c,initial_episodes=initial['episodes'],initial_iteration=initial['generation'],initial_timesteps=initial['timesteps'])
                 workflow._budget_audit=audit;workflow._observed_ec_rollouts=0
                 per_step=int(c.pop_size)*int(c.episodes_for_fitness)+int(c.num_rl_agents)*int(c.rollout_episodes)
                 target=initial['generation']+math.ceil(max(0,int(c.total_episodes)-initial['episodes'])/per_step)
