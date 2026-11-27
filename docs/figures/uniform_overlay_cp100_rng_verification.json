@@ -1,0 +1,158 @@
+{
+  "3083": {
+    "R": {
+      "checkpoint": "/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/algorithm/random-source-priority-v1/seed_3083/runs/R/segments/78306db7b44c4b019e8486072e2532d8/checkpoints/100",
+      "intervention_key": [
+        3328147570,
+        1210431008
+      ],
+      "training_key": [
+        1351733739,
+        2703158163
+      ],
+      "ga_key": [
+        3389313561,
+        913213635
+      ],
+      "budget": {
+        "initial_episodes": 320,
+        "initial_iteration": 10,
+        "initial_timesteps": 320000,
+        "episodes": 2970,
+        "timesteps": 2970000,
+        "updates": 1440000,
+        "steps": 90,
+        "ask": 90,
+        "tell": 90,
+        "checkpoints": [
+          20,
+          30,
+          40,
+          50,
+          60,
+          70,
+          80,
+          90,
+          100
+        ],
+        "eval_episodes": 1152
+      }
+    },
+    "U": {
+      "checkpoint": "/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/algorithm/uniform-overlay-cp100-v1/seed_3083/runs/U/segments/4d3c730a683f4123ae6ee0c32e67e593/checkpoints/100",
+      "intervention_key": [
+        3328147570,
+        1210431008
+      ],
+      "training_key": [
+        1351733739,
+        2703158163
+      ],
+      "ga_key": [
+        3389313561,
+        913213635
+      ],
+      "budget": {
+        "initial_episodes": 320,
+        "initial_iteration": 10,
+        "initial_timesteps": 320000,
+        "episodes": 2970,
+        "timesteps": 2970000,
+        "updates": 1440000,
+        "steps": 90,
+        "ask": 90,
+        "tell": 90,
+        "checkpoints": [
+          20,
+          30,
+          40,
+          50,
+          60,
+          70,
+          80,
+          90,
+          100
+        ],
+        "eval_episodes": 1152
+      }
+    }
+  },
+  "3079": {
+    "R": {
+      "checkpoint": "/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/algorithm/random-source-priority-v1/seed_3079/runs/R/segments/9078a1f42b32402ba96c40d310cf1513/checkpoints/100",
+      "intervention_key": [
+        1134713078,
+        3126681127
+      ],
+      "training_key": [
+        4043631237,
+        4276455190
+      ],
+      "ga_key": [
+        1605925304,
+        3953563189
+      ],
+      "budget": {
+        "initial_episodes": 320,
+        "initial_iteration": 10,
+        "initial_timesteps": 320000,
+        "episodes": 2970,
+        "timesteps": 2970000,
+        "updates": 1440000,
+        "steps": 90,
+        "ask": 90,
+        "tell": 90,
+        "checkpoints": [
+          20,
+          30,
+          40,
+          50,
+          60,
+          70,
+          80,
+          90,
+          100
+        ],
+        "eval_episodes": 1152
+      }
+    },
+    "U": {
+      "checkpoint": "/disk1/zmh_projects/evorl_artifacts/learner_utility_replay_pilot/algorithm/uniform-overlay-cp100-v1/seed_3079/runs/U/segments/f29ad591e7af405899ccc6b8fa7b7fd5/checkpoints/100",
+      "intervention_key": [
+        1134713078,
+        3126681127
+      ],
+      "training_key": [
+        4043631237,
+        4276455190
+      ],
+      "ga_key": [
+        1605925304,
+        3953563189
+      ],
+      "budget": {
+        "initial_episodes": 320,
+        "initial_iteration": 10,
+        "initial_timesteps": 320000,
+        "episodes": 2970,
+        "timesteps": 2970000,
+        "updates": 1440000,
+        "steps": 90,
+        "ask": 90,
+        "tell": 90,
+        "checkpoints": [
+          20,
+          30,
+          40,
+          50,
+          60,
+          70,
+          80,
+          90,
+          100
+        ],
+        "eval_episodes": 1152
+      }
+    }
+  }
+}
