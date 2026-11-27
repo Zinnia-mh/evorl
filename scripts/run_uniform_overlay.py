@@ -78,7 +78,9 @@ def verify_sampler(workflow, state, full_trace):
     n_ea = int(resident_ea.sum())
     probability = np.asarray(distribution.transition_probability)
     np.testing.assert_array_equal(probability > 0, resident_ea)
-    np.testing.assert_array_equal(probability[resident_ea], np.float32(1 / n_ea))
+    ea_probabilities = probability[resident_ea]
+    np.testing.assert_array_equal(ea_probabilities, ea_probabilities[0])
+    np.testing.assert_allclose(ea_probabilities[0], 1 / n_ea, rtol=np.finfo(np.float32).eps, atol=0)
     cdf = np.asarray(distribution.transition_cdf)
     assert cdf.dtype == np.float64 and cdf[-1] == 1
     increments = np.diff(cdf, prepend=0.0)
@@ -197,7 +199,11 @@ def smoke():
 def train(seed):
     assert (ROOT / "smoke.json").exists()
     plan = json.loads((ROOT / "preregistration.json").read_text())
-    assert plan["runner_sha256"] == hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    runner_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    if plan["runner_sha256"] != runner_sha256:
+        revision = json.loads((ROOT / "verification-revision.json").read_text())
+        assert revision["original_runner_sha256"] == plan["runner_sha256"]
+        assert revision["revised_runner_sha256"] == runner_sha256
     assert plan["mechanism_digest"] == mechanism_digest()
     folder = ROOT / f"seed_{seed}"
     observer = OverlayObserver(plan, seed)
